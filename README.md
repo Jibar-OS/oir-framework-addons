@@ -29,7 +29,7 @@ The OIR Java classes end up in `services.jar` (platform service) and `framework.
 
 - [`oir-patches`](https://github.com/jibar-os/oir-patches) — the 5 small edits to upstream AOSP this repo depends on
 - [`oir-sdk`](https://github.com/jibar-os/oir-sdk) — apps' client-side dependency
-- [`github.com/Jibar-OS/jibar-os`](https://github.com/Jibar-OS/jibar-os) — architecture + capability model
+- [`github.com/Jibar-OS/JibarOS`](https://github.com/Jibar-OS/JibarOS) — architecture + capability model
 
 ## Migration status
 
