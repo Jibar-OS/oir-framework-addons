@@ -1,0 +1,18 @@
+// Copyright (C) 2026 The OpenIntelligenceRuntime Project
+// Licensed under the Apache License, Version 2.0
+
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+aconfig_declarations {
+    name: "oir_flags",
+    package: "com.android.oir.flags",
+    container: "system_ext",
+    srcs: ["oir_flags.aconfig"],
+}
+
+java_aconfig_library {
+    name: "oir_flags-lib",
+    aconfig_declarations: "oir_flags",
+}

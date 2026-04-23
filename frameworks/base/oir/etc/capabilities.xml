@@ -1,0 +1,157 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+OIR v0.6 platform-default capabilities.
+
+Installs to /system_ext/etc/oir/capabilities.xml via prebuilt_etc module
+oir_capabilities_xml in PRODUCT_PACKAGES.
+
+OEMs extend via reverse-DNS-named capabilities in fragments under
+/vendor/etc/oir/*.xml (merged at boot). OEMs CANNOT override entries
+under reserved prefixes (text./audio./vision./code./oir./android./os./).
+
+To ship two models for the same semantic capability (e.g. a fast small
+model + a quality large model), use the `:variant` suffix convention:
+
+    <capability name="text.complete:fast" ... />
+    <capability name="text.complete:quality" ... />
+
+Variants are fully distinct capabilities at runtime — separate handles,
+separate memory accounting, no implicit fallback. Apps request the
+variant they want explicitly. Variant names match [a-z0-9_]{1,32}.
+The name `:default` is reserved for a future v1.0 fallback mechanism —
+do not ship `:default` today. See notes/CAPABILITY_TAXONOMY.md §5.3.
+
+For `vision.describe` and `vision.detect`: no default-model is bundled.
+OEMs bake their model into /product/etc/oir/ via PRODUCT_PACKAGES in
+device.mk, or dev workflow pushes to /data/local/oir/ via adb.
+
+For `vision.detect`: the model is ONNX (YOLO-family typically) and has
+a sidecar class-labels JSON at <model-basename>.classes.json in the
+same directory. See notes/VISION_DETECT_SIDECAR.md.
+
+v0.5 adds the optional `backend=` attribute. Values: "llama" / "mtmd" /
+"whisper" / "ort". When omitted the registry default-fills based on
+capability name (text.* / code.* → llama; vision.describe → mtmd;
+audio.transcribe → whisper; everything else → ort). OEMs only set
+`backend=` explicitly when they swap the default model for one that
+needs a different runtime — e.g. shipping a SigLIP GGUF instead of
+the ONNX export forces `backend="mtmd"` on vision.embed. Older OIR
+ignores unknown attributes (forward-compat).
+-->
+<capabilities>
+    <!-- Text -->
+    <capability name="text.complete"
+                shape="TokenStream"
+                required-permission="oir.permission.USE_TEXT"
+                default-model="/product/etc/oir/qwen2.5-0.5b-instruct-q4_k_m.gguf" />
+
+    <capability name="text.embed"
+                shape="Vector"
+                required-permission="oir.permission.USE_TEXT"
+                default-model="/product/etc/oir/all-MiniLM-L6-v2.Q8_0.gguf" />
+
+    <!-- Audio -->
+    <capability name="audio.transcribe"
+                shape="TokenStream"
+                required-permission="oir.permission.USE_AUDIO"
+                default-model="/product/etc/oir/whisper-tiny-en.Q5.bin" />
+
+    <capability name="audio.synthesize"
+                shape="AudioStream"
+                required-permission="oir.permission.USE_AUDIO"
+                default-model="/product/etc/oir/piper-en-us-amy-low.onnx" />
+
+    <!-- v0.5 V5: audio.vad — voice activity detection. Silero VAD (MIT, ~2 MB)
+         ships as the platform default — small, permissive, good baseline.
+         Runtime emits RealtimeBoolean state per 32 ms window via the
+         IOIRRealtimeBooleanCallback shape (frozen v0.5). -->
+    <capability name="audio.vad"
+                shape="RealtimeBoolean"
+                required-permission="oir.permission.USE_AUDIO"
+                default-model="/product/etc/oir/silero_vad.onnx" />
+
+
+    <!-- Vision -->
+    <capability name="vision.embed"
+                shape="Vector"
+                required-permission="oir.permission.USE_VISION"
+                default-model="/product/etc/oir/siglip-base-patch16-224.onnx" />
+
+    <!-- vision.describe: runtime ready (libllava + clip.cpp in oird). No
+         default model — OEMs bake a LLaVA-family VLM; default-model is
+         pipe-delimited "<mmproj-path>|<llm-path>". Validated on cvd with
+         LLaVA-1.5-7b-Q4. Modern small VLMs (moondream v2, LLaVA-Phi-3,
+         MiniCPM-V) need the clip.cpp bump in v0.5. See OEM_MODEL_BAKE_IN.md. -->
+    <capability name="vision.describe"
+                shape="TokenStream"
+                required-permission="oir.permission.USE_VISION" />
+
+    <!-- vision.detect: runtime supports two output families.
+         Default ships RT-DETR (Apache 2.0, ~40 MB, COCO-80) as the
+         permissive default. OEMs swap to YOLOv8 (AGPL — accept
+         obligations) or YOLO-NAS / domain-specific via fragments under
+         /vendor/etc/oir/. The `family=` OEM knob picks the output
+         parser — "rtdetr" (default for the bundled model), "yolov8"
+         for YOLO-shape detectors. COCO-80 labels embedded as fallback;
+         <model>.classes.json sidecar override per VISION_DETECT_SIDECAR.md. -->
+    <capability name="vision.detect"
+                shape="BoundingBoxes"
+                required-permission="oir.permission.USE_VISION"
+                default-model="/product/etc/oir/rtdetr-r50vd-coco.onnx" />
+
+    <!--
+    =============================================================
+    v0.6 — Phase B new capabilities
+    =============================================================
+
+    Policy per the v0.6 principle: if a fitting default model exists
+    within the memory budget, ship it. Otherwise declare the capability
+    with NO default-model, so apps get a clean
+    CAPABILITY_UNAVAILABLE_NO_MODEL error and OEMs bake their own.
+    -->
+
+    <!-- text.classify: multi-label text classification. Shape=Vector of
+         per-label scores. No broadly-useful small default classifier
+         exists (sentiment/topic/toxic etc. are each task-specific),
+         so the platform ships the capability declared but unbacked.
+         OEMs drop an ONNX classifier at /product/etc/oir/ and override
+         in /vendor/etc/oir/ fragments. -->
+    <capability name="text.classify"
+                shape="Vector"
+                required-permission="oir.permission.USE_TEXT"
+                backend="ort" />
+
+    <!-- text.rerank: cross-encoder query-vs-document scoring. Shape=Vector
+         (one score per candidate). ms-marco-MiniLM-L-6-v2 (Apache 2.0,
+         ~22 MB ONNX Q8) is the canonical small reranker and fits every
+         tier; platform ships it by default. OEMs can swap for larger
+         rerankers via /vendor/etc/oir/. -->
+    <capability name="text.rerank"
+                shape="Vector"
+                required-permission="oir.permission.USE_TEXT"
+                backend="ort"
+                default-model="/product/etc/oir/ms-marco-minilm-l6-v2.onnx" />
+
+    <!-- text.translate: text → text translation. Shape=TokenStream.
+         Reuses the in-budget text.complete LLM (qwen2.5-0.5b-instruct)
+         via prompt-template rewriting: "Translate the following text
+         from <src> to <tgt>:\n<text>". Zero marginal memory — the
+         text.complete pool serves both. OEMs who want dedicated seq2seq
+         (NLLB / MarianMT ONNX) drop a model in /vendor/etc/oir/. -->
+    <capability name="text.translate"
+                shape="TokenStream"
+                required-permission="oir.permission.USE_TEXT"
+                backend="llama"
+                default-model="/product/etc/oir/qwen2.5-0.5b-instruct-q4_k_m.gguf" />
+
+    <!-- vision.ocr: image → text + bounding boxes. Shape=BoundingBoxes
+         (reuses the vision.detect callback: per-region bbox + label
+         where label is the OCR'd string). No small general-purpose OCR
+         ships as the default (PaddleOCR et al. need det+rec ONNX pair
+         ~50 MB total plus per-language rec heads; OEMs make locale
+         choices). Platform declares the capability unbacked. -->
+    <capability name="vision.ocr"
+                shape="BoundingBoxes"
+                required-permission="oir.permission.USE_VISION"
+                backend="ort" />
+</capabilities>

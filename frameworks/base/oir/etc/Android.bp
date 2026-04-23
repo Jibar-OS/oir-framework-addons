@@ -1,0 +1,14 @@
+// Copyright (C) 2026 The OpenIntelligenceRuntime Project
+// Licensed under the Apache License, Version 2.0
+
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+prebuilt_etc {
+    name: "oir_capabilities_xml",
+    src: "capabilities.xml",
+    sub_dir: "oir",
+    system_ext_specific: true,
+    filename: "capabilities.xml",
+}

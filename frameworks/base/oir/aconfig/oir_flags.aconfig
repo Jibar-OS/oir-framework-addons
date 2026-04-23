@@ -1,0 +1,25 @@
+# OIR feature flags
+# Docs: https://source.android.com/docs/core/architecture/aconfig
+#
+# These flags gate new public-API additions from OIR. A16's api-stability
+# lint requires @FlaggedApi(Flags.FLAG_<name>) on every new @SystemApi or
+# public API surface added since a baseline; without a flag, the lint
+# rejects the patch.
+#
+# v0.2 declares the foundational flag for SUBMIT_OIR_REQUEST permission.
+# v0.3 will actually wire @FlaggedApi to it when the permission ships.
+
+package: "com.android.oir.flags"
+container: "system_ext"
+
+flag {
+    name: "oir_v1_api"
+    namespace: "oir"
+    description: "Gates the OIR v1 public API surface (SUBMIT_OIR_REQUEST, \
+                   capabilities.xml, android.oir.* package). Always enabled \
+                   once OIR v1 ships on a device; flags give us per-device \
+                   rollout control during the staged launch."
+    bug: "0"
+    is_fixed_read_only: true
+    is_exported: true
+}
