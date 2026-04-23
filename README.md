@@ -31,6 +31,3 @@ The OIR Java classes end up in `services.jar` (platform service) and `framework.
 - [`oir-sdk`](https://github.com/jibar-os/oir-sdk) — apps' client-side dependency
 - [`github.com/Jibar-OS/JibarOS`](https://github.com/Jibar-OS/JibarOS) — architecture + capability model
 
-## Migration status
-
-🚧 Code migration in progress.
