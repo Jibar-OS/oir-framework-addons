@@ -7,7 +7,7 @@ oir_capabilities_xml in PRODUCT_PACKAGES.
 
 OEMs extend via reverse-DNS-named capabilities in fragments under
 /vendor/etc/oir/*.xml (merged at boot). OEMs CANNOT override entries
-under reserved prefixes (text./audio./vision./code./oir./android./os./).
+under reserved prefixes (text./audio./vision./oir./android./os./).
 
 To ship two models for the same semantic capability (e.g. a fast small
 model + a quality large model), use the `:variant` suffix convention:
@@ -31,7 +31,7 @@ same directory. See notes/VISION_DETECT_SIDECAR.md.
 
 v0.5 adds the optional `backend=` attribute. Values: "llama" / "mtmd" /
 "whisper" / "ort". When omitted the registry default-fills based on
-capability name (text.* / code.* → llama; vision.describe → mtmd;
+capability name (text.* → llama; vision.describe → mtmd;
 audio.transcribe → whisper; everything else → ort). OEMs only set
 `backend=` explicitly when they swap the default model for one that
 needs a different runtime — e.g. shipping a SigLIP GGUF instead of

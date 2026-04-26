@@ -25,7 +25,7 @@ import java.util.Map;
  * and merges OEM fragments from /vendor/etc/oir/*.xml (lexicographic order).
  *
  * Governance:
- *   - Reserved namespace prefixes (text./audio./vision./code./oir./android./os.)
+ *   - Reserved namespace prefixes (text./audio./vision./oir./android./os.)
  *     only the platform XML may declare. OEM fragments declaring entries under
  *     reserved prefixes are rejected with a logged warning.
  *   - OEMs extend via reverse-DNS (com.oem.xxx) and must declare their own
@@ -38,7 +38,7 @@ public final class CapabilityRegistry {
     static final String OEM_FRAGMENTS  = "/vendor/etc/oir";
 
     private static final String[] RESERVED_PREFIXES = {
-        "text.", "audio.", "vision.", "code.", "oir.", "android.", "os."
+        "text.", "audio.", "vision.", "oir.", "android.", "os."
     };
 
     // LinkedHashMap preserves declaration order — useful for dumpsys output.
@@ -191,7 +191,7 @@ public final class CapabilityRegistry {
     /**
      * Default backend per capability when the XML omits {@code backend=}. Mirrors
      * the v0.4-era hardwired routing in OIRService:
-     *   text.* / code.*       → llama (or mtmd if vision.describe-shaped)
+     *   text.*                → llama (or mtmd if vision.describe-shaped)
      *   vision.describe       → mtmd
      *   audio.transcribe      → whisper
      *   audio.synthesize / audio.vad / vision.detect / vision.embed → ort
@@ -201,7 +201,7 @@ public final class CapabilityRegistry {
     private static String defaultBackendForCapability(String name) {
         if (name.startsWith("text.complete") || name.startsWith("text.embed")
                 || name.startsWith("text.classify") || name.startsWith("text.rerank")
-                || name.startsWith("text.translate") || name.startsWith("code.")) {
+                || name.startsWith("text.translate")) {
             return "llama";
         }
         if (name.startsWith("vision.describe")) return "mtmd";
@@ -219,7 +219,6 @@ public final class CapabilityRegistry {
 
     private static String defaultPermissionForNamespace(String name) {
         if (name.startsWith("text."))   return "oir.permission.USE_TEXT";
-        if (name.startsWith("code."))   return "oir.permission.USE_TEXT";
         if (name.startsWith("audio."))  return "oir.permission.USE_AUDIO";
         if (name.startsWith("vision.")) return "oir.permission.USE_VISION";
         // oir.*, android.*, os.* are handled explicitly in XML or by the caller.
