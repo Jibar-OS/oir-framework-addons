@@ -132,6 +132,10 @@ public class OIRService extends SystemService {
 
     private final CapabilityRegistry mCapabilityRegistry = new CapabilityRegistry();
     private final OirConfig mConfig = new OirConfig();
+
+    /** v0.7: surface for cmd oir dumpsys config. Returns the live OirConfig
+     *  instance (read-only callers only — call mConfig.getXxx accessors). */
+    public OirConfig getOirConfig() { return mConfig; }
     // v0.5 V6: per-UID token-bucket rate limiter. Configured from mConfig at onStart.
     private final RateLimiter mRateLimiter = new RateLimiter();
 

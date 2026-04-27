@@ -154,6 +154,7 @@ public class OIRShellCommand extends ShellCommand {
         pw.println("  cmd oir vembed <img>           vision.embed → pooled vector.");
         pw.println("  cmd oir warm <capability>      lazy-load the default model for <cap>.");
         pw.println("  cmd oir dumpsys capabilities   List declared caps + runnability status.");
+        pw.println("  cmd oir dumpsys config         Show resolved global + per-capability knobs.");
         pw.println("  cmd oir memory                 Runtime memory snapshot.");
         pw.println("  cmd oir help                   This help.");
     }
@@ -161,6 +162,9 @@ public class OIRShellCommand extends ShellCommand {
     private int cmdDumpsys() {
         final PrintWriter pw = getOutPrintWriter();
         String target = getNextArg();
+        if ("config".equals(target)) {
+            return cmdDumpsysConfig();
+        }
         if (target == null || "capabilities".equals(target)) {
             CapabilityRegistry reg = mRegistry;
             java.util.Collection<Capability> all = reg.all();
@@ -210,6 +214,34 @@ public class OIRShellCommand extends ShellCommand {
         }
         getErrPrintWriter().println("unknown dumpsys target: " + target);
         return 1;
+    }
+
+    private int cmdDumpsysConfig() {
+        final PrintWriter pw = getOutPrintWriter();
+        OirConfig c = mOwner.getOirConfig();
+        pw.println("OIR config (resolved from /system_ext/etc/oir/oir_config.xml + /vendor/etc/oir/oir_config.xml):");
+        pw.println("");
+        pw.println("Global knobs:");
+        pw.println("  memory_budget_mb            = " + c.getMemoryBudgetMb());
+        pw.println("  warm_ttl_seconds            = " + c.getWarmTtlSeconds());
+        pw.println("  inference_timeout_seconds   = " + c.getInferenceTimeoutSecs());
+        pw.println("  rate_limit_per_minute       = " + c.getRateLimitPerMinute());
+        pw.println("  rate_limit_burst            = " + c.getRateLimitBurst());
+        pw.println("");
+        java.util.Map<String,Float> num = c.getCapabilityTuning();
+        java.util.Map<String,String> str = c.getCapabilityTuningStrings();
+        if (num.isEmpty() && str.isEmpty()) {
+            pw.println("Capability tuning: <none — all defaults>");
+        } else {
+            pw.println("Capability tuning (" + (num.size() + str.size()) + " overrides):");
+            for (java.util.Map.Entry<String,Float> e : new java.util.TreeMap<>(num).entrySet()) {
+                pw.println("  " + e.getKey() + " = " + e.getValue());
+            }
+            for (java.util.Map.Entry<String,String> e : new java.util.TreeMap<>(str).entrySet()) {
+                pw.println("  " + e.getKey() + " = \"" + e.getValue() + "\"");
+            }
+        }
+        return 0;
     }
 
     private int cmdWarm() {
