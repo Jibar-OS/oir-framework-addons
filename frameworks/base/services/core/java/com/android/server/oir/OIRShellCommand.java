@@ -785,6 +785,11 @@ public class OIRShellCommand extends ShellCommand {
             pw.printf("    models loaded:    %d%n", s.modelCount);
             pw.printf("    resident:         %d MB%n%n", s.residentMb);
             long now = System.currentTimeMillis();
+            // v0.7: backend / pool / busy / waiting now come from the
+            // MemoryStats parcelable directly (was a separate
+            // dumpRuntimeStats TSV call before getMemoryStats was extended).
+            final boolean hasPool = s.backendLabels != null
+                    && s.backendLabels.length == s.modelCount;
             for (int i = 0; i < s.modelCount; i++) {
                 long ageS = (now - s.loadTimestampMs[i]) / 1000;
                 long lastS = (now - s.lastAccessMs[i]) / 1000;
@@ -792,23 +797,12 @@ public class OIRShellCommand extends ShellCommand {
                 pw.printf("      size:         %d MB%n", s.modelSizesMb[i]);
                 pw.printf("      loaded:       %d s ago%n", ageS);
                 pw.printf("      last_access:  %d s ago%n", lastS);
-            }
-            // v0.6.3: runtime pool snapshot. Augments the model-level stats
-            // above with concurrency view (backend / pool_size / busy /
-            // waiting). Source: IOirWorker.dumpRuntimeStats() — TSV per
-            // loaded model.
-            String tsv = mOwner.getInternalRuntimeStats();
-            if (tsv != null && !tsv.isEmpty()) {
-                pw.println();
-                pw.println("  runtime pools:");
-                pw.println("    handle  backend       pool  busy  wait   sizeMB  path");
-                for (String line : tsv.split("\n")) {
-                    if (line.isEmpty()) continue;
-                    String[] cols = line.split("\t");
-                    if (cols.length < 7) continue;
-                    pw.printf("    %-6s  %-12s  %-4s  %-4s  %-4s   %-6s  %s%n",
-                            cols[0], cols[1], cols[2], cols[3], cols[4],
-                            cols[5], cols[6]);
+                if (hasPool) {
+                    pw.printf("      backend:      %s%n", s.backendLabels[i]);
+                    if (s.poolSizes[i] > 0) {
+                        pw.printf("      pool:         %d slots (busy=%d, waiting=%d)%n",
+                                s.poolSizes[i], s.busyCounts[i], s.waitingCounts[i]);
+                    }
                 }
             }
             return 0;

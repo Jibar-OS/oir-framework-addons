@@ -21,4 +21,17 @@ parcelable MemoryStats {
     int[]    modelSizesMb;
     long[]   loadTimestampMs;
     long[]   lastAccessMs;
+
+    // Per-model pool telemetry, parallel to the arrays above. ORT-backed
+    // models report poolSize=0 (no pool abstraction; ORT::Session::Run
+    // is thread-safe by design). VLM models share llama context pools,
+    // so poolSize/busy/waiting reflect the underlying llama pool entry.
+    /** "llama" / "llama_embed" / "whisper" / "ort" / "mtmd". */
+    String[] backendLabels;
+    /** Pool slots configured for this handle. 0 = no pool. */
+    int[]    poolSizes;
+    /** Pool slots currently leased. */
+    int[]    busyCounts;
+    /** Callers currently queued waiting for a free slot. */
+    int[]    waitingCounts;
 }
