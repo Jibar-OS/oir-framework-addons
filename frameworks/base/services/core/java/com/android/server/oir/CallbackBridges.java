@@ -4,15 +4,21 @@
  */
 package com.android.server.oir;
 
+import android.oir.BoundingBox;
 import android.oir.IOIRAudioStreamCallback;
 import android.oir.IOIRBoundingBoxCallback;
 import android.oir.IOIRRealtimeBooleanCallback;
 import android.oir.IOIRTokenCallback;
 import android.oir.IOIRVectorCallback;
+import android.os.Bundle;
 import android.os.CancellationSignal;
 import android.os.ICancellationSignal;
 import android.os.RemoteException;
 import android.util.Log;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Shared callback-side helpers for OIRService and the per-namespace
@@ -118,6 +124,196 @@ final class CallbackBridges {
                     });
         } catch (Exception e) {
             Log.w(TAG, "setOnCancelListener failed app=" + appHandle, e);
+        }
+    }
+
+    // ---- Worker→app callback bridges -----------------------------------------
+    // Each bridge implements one IOirWorkerXxxCallback.Stub (the binder transport
+    // from oird) and forwards events to the matching IOIRXxxCallback (the public
+    // API the app passed in). Terminal events (onComplete / onError / onVector /
+    // onBoundingBoxes / one-shot completions) remove the appHandle entry from the
+    // shared cancellation routing map, so cancel() on a completed request is a
+    // safe no-op rather than firing against a stale handle.
+    //
+    // These were inner classes of OIRService until phase 3; promoted to
+    // CallbackBridges so the new namespace dispatchers (TextDispatcher /
+    // AudioDispatcher / VisionDispatcher) can construct them directly without
+    // needing OIRService.this captured.
+
+    /** Token-stream relay: text.complete, text.translate, audio.transcribe, vision.describe. */
+    static final class TokenBridge extends IOirWorkerCallback.Stub {
+        private final long mAppHandle;
+        private final IOIRTokenCallback mAppCallback;
+        private final ConcurrentHashMap<Long, Long> mHandleMap;
+
+        TokenBridge(long appHandle, IOIRTokenCallback appCallback,
+                ConcurrentHashMap<Long, Long> handleMap) {
+            mAppHandle = appHandle;
+            mAppCallback = appCallback;
+            mHandleMap = handleMap;
+        }
+
+        @Override public void onToken(String token, int outputIndex) {
+            try { mAppCallback.onToken(token, outputIndex); }
+            catch (RemoteException e) { Log.w(TAG, "onToken failed app=" + mAppHandle, e); }
+        }
+
+        @Override public void onComplete(int totalTokens, long firstTokenMs, long totalMs) {
+            mHandleMap.remove(mAppHandle);
+            Bundle appStats = new Bundle();
+            appStats.putInt("totalTokens", totalTokens);
+            appStats.putLong("firstTokenMs", firstTokenMs);
+            appStats.putLong("totalMs", totalMs);
+            try { mAppCallback.onComplete(appStats); }
+            catch (RemoteException e) { Log.w(TAG, "onComplete failed app=" + mAppHandle, e); }
+        }
+
+        @Override public void onError(int workerErrorCode, String message) {
+            mHandleMap.remove(mAppHandle);
+            safeAppError(mAppCallback, workerErrorCode, message);
+        }
+    }
+
+    /** Single-vector relay: text.embed, text.classify, vision.embed. */
+    static final class VectorBridge extends IOirWorkerVectorCallback.Stub {
+        private final long mAppHandle;
+        private final IOIRVectorCallback mAppCallback;
+        private final ConcurrentHashMap<Long, Long> mHandleMap;
+
+        VectorBridge(long appHandle, IOIRVectorCallback appCallback,
+                ConcurrentHashMap<Long, Long> handleMap) {
+            mAppHandle = appHandle;
+            mAppCallback = appCallback;
+            mHandleMap = handleMap;
+        }
+
+        @Override public void onVector(float[] vec) {
+            mHandleMap.remove(mAppHandle);
+            try { mAppCallback.onVector(vec); }
+            catch (RemoteException e) { Log.w(TAG, "onVector app=" + mAppHandle + " relay failed", e); }
+        }
+
+        @Override public void onError(int workerCode, String message) {
+            mHandleMap.remove(mAppHandle);
+            try { mAppCallback.onError(workerCode, message); }
+            catch (RemoteException e) { Log.w(TAG, "onError(vec) app=" + mAppHandle + " relay failed", e); }
+        }
+    }
+
+    /** Audio-stream relay: audio.synthesize. */
+    static final class AudioBridge extends IOirWorkerAudioCallback.Stub {
+        private final long mAppHandle;
+        private final IOIRAudioStreamCallback mAppCallback;
+        private final ConcurrentHashMap<Long, Long> mHandleMap;
+
+        AudioBridge(long appHandle, IOIRAudioStreamCallback appCallback,
+                ConcurrentHashMap<Long, Long> handleMap) {
+            mAppHandle = appHandle;
+            mAppCallback = appCallback;
+            mHandleMap = handleMap;
+        }
+
+        @Override public void onChunk(byte[] pcm, int sampleRateHz, int channelCount,
+                int encoding, boolean last) {
+            try { mAppCallback.onChunk(pcm, sampleRateHz, channelCount, encoding, last); }
+            catch (RemoteException e) { Log.w(TAG, "onChunk app=" + mAppHandle + " relay failed", e); }
+        }
+
+        @Override public void onComplete(long totalMs) {
+            mHandleMap.remove(mAppHandle);
+            try { mAppCallback.onComplete(totalMs); }
+            catch (RemoteException e) { Log.w(TAG, "onComplete(audio) app=" + mAppHandle + " relay failed", e); }
+        }
+
+        @Override public void onError(int workerCode, String message) {
+            mHandleMap.remove(mAppHandle);
+            try { mAppCallback.onError(workerCode, message); }
+            catch (RemoteException e) { Log.w(TAG, "onError(audio) app=" + mAppHandle + " relay failed", e); }
+        }
+    }
+
+    /**
+     * Realtime-boolean relay: audio.vad. Trivial pass-through — both shapes are
+     * identical (bool + timestampMs + terminal onComplete / onError). Kept as
+     * its own bridge so the public callback can evolve independently of the
+     * worker callback if needed.
+     */
+    static final class BooleanBridge extends IOirWorkerRealtimeBooleanCallback.Stub {
+        private final long mAppHandle;
+        private final IOIRRealtimeBooleanCallback mAppCallback;
+        private final ConcurrentHashMap<Long, Long> mHandleMap;
+
+        BooleanBridge(long appHandle, IOIRRealtimeBooleanCallback appCallback,
+                ConcurrentHashMap<Long, Long> handleMap) {
+            mAppHandle = appHandle;
+            mAppCallback = appCallback;
+            mHandleMap = handleMap;
+        }
+
+        @Override public void onState(boolean isTrue, long timestampMs) {
+            try { mAppCallback.onState(isTrue, timestampMs); }
+            catch (RemoteException e) { Log.w(TAG, "onState app=" + mAppHandle + " relay failed", e); }
+        }
+
+        @Override public void onComplete() {
+            mHandleMap.remove(mAppHandle);
+            try { mAppCallback.onComplete(); }
+            catch (RemoteException e) { Log.w(TAG, "onComplete(bool) app=" + mAppHandle + " relay failed", e); }
+        }
+
+        @Override public void onError(int workerCode, String message) {
+            mHandleMap.remove(mAppHandle);
+            try { mAppCallback.onError(workerCode, message); }
+            catch (RemoteException e) { Log.w(TAG, "onError(bool) app=" + mAppHandle + " relay failed", e); }
+        }
+    }
+
+    /**
+     * Bounding-box relay: vision.detect, vision.ocr. Worker sends flattened
+     * parallel arrays (NDK AIDL limitation); this repacks into List&lt;BoundingBox&gt;
+     * for the public callback.
+     */
+    static final class BboxBridge extends IOirWorkerBboxCallback.Stub {
+        private final long mAppHandle;
+        private final IOIRBoundingBoxCallback mAppCallback;
+        private final ConcurrentHashMap<Long, Long> mHandleMap;
+
+        BboxBridge(long appHandle, IOIRBoundingBoxCallback appCallback,
+                ConcurrentHashMap<Long, Long> handleMap) {
+            mAppHandle = appHandle;
+            mAppCallback = appCallback;
+            mHandleMap = handleMap;
+        }
+
+        @Override public void onBoundingBoxes(int[] xs, int[] ys, int[] widths, int[] heights,
+                int[] labelsPerBox, String[] labelsFlat, float[] scoresFlat) {
+            mHandleMap.remove(mAppHandle);
+            List<BoundingBox> boxes = new ArrayList<>(xs.length);
+            int labelOffset = 0;
+            for (int i = 0; i < xs.length; i++) {
+                BoundingBox bb = new BoundingBox();
+                bb.x = xs[i];
+                bb.y = ys[i];
+                bb.width = widths[i];
+                bb.height = heights[i];
+                int n = labelsPerBox[i];
+                bb.labels = new String[n];
+                bb.scores = new float[n];
+                for (int j = 0; j < n; j++) {
+                    bb.labels[j] = labelsFlat[labelOffset + j];
+                    bb.scores[j] = scoresFlat[labelOffset + j];
+                }
+                labelOffset += n;
+                boxes.add(bb);
+            }
+            try { mAppCallback.onBoundingBoxes(boxes); }
+            catch (RemoteException e) { Log.w(TAG, "onBoundingBoxes app=" + mAppHandle + " relay failed", e); }
+        }
+
+        @Override public void onError(int workerCode, String message) {
+            mHandleMap.remove(mAppHandle);
+            try { mAppCallback.onError(workerCode, message); }
+            catch (RemoteException e) { Log.w(TAG, "onError(bbox) app=" + mAppHandle + " relay failed", e); }
         }
     }
 }

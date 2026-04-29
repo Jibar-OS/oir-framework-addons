@@ -95,6 +95,31 @@ public final class OirConfig {
         return Collections.unmodifiableMap(mCapabilityTuningStr);
     }
 
+    /**
+     * Resolve the {@code <capability>.n_ctx} tuning override, with a
+     * sensible fallback. v0.6.1 audit: AgentKit's prompt-compaction math
+     * needs the runtime-configured ctx size, not the hardcoded value
+     * that earlier callers were passing into the onStart Bundle.
+     *
+     * text.translate inherits text.complete.n_ctx when it has no explicit
+     * override, since v0.6 routes translate through the text.complete
+     * llama pool by prompt-template rewriting.
+     *
+     * Cast to int is safe: n_ctx values parsed as floats are always
+     * integer-valued in practice; Math.max enforces a floor against
+     * corrupt config.
+     */
+    public int getCapabilityCtxSize(String capability, int fallback) {
+        if (capability == null) return fallback;
+        Float v = mCapabilityTuning.get(capability + ".n_ctx");
+        if (v != null) return Math.max(1, v.intValue());
+        if (capability.startsWith("text.translate")) {
+            v = mCapabilityTuning.get("text.complete.n_ctx");
+            if (v != null) return Math.max(1, v.intValue());
+        }
+        return fallback;
+    }
+
     private void loadFile(File f) {
         if (!f.isFile()) return;  // silently skip missing files
         try (FileInputStream in = new FileInputStream(f)) {
