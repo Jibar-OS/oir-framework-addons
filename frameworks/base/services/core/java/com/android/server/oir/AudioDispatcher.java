@@ -7,7 +7,6 @@ package com.android.server.oir;
 import android.oir.IOIRAudioStreamCallback;
 import android.oir.IOIRRealtimeBooleanCallback;
 import android.oir.IOIRTokenCallback;
-import android.os.Binder;
 import android.os.Bundle;
 import android.os.ICancellationSignal;
 import android.os.RemoteException;
@@ -21,14 +20,12 @@ import android.util.Log;
  * with VAD/ASR cascade) — same shape as the one-shot methods here, plus
  * a SessionRegistry handle (deferred design).
  */
-final class AudioDispatcher {
+final class AudioDispatcher extends NamespaceDispatcher {
 
     private static final String TAG = "OIRAudioDispatcher";
 
-    private final DispatcherDeps mDeps;
-
     AudioDispatcher(DispatcherDeps deps) {
-        mDeps = deps;
+        super(deps);
     }
 
     /**
@@ -151,45 +148,20 @@ final class AudioDispatcher {
         }
     }
 
-    private long preflight(String capability, ModelEnsurer.ErrorReporter reporter) {
-        if (mDeps.registry.get(capability) == null) {
-            reporter.report(OIRError.INVALID_INPUT, "unknown capability: " + capability);
-            return 0L;
-        }
-        try {
-            mDeps.enforcer.enforce(capability, Binder.getCallingUid(), Binder.getCallingPid());
-        } catch (SecurityException se) {
-            reporter.report(OIRError.PERMISSION_DENIED, se.getMessage());
-            return 0L;
-        }
-        final int uid = Binder.getCallingUid();
-        if (!mDeps.rateLimiter.tryAcquire(uid)) {
-            long waitMs = mDeps.rateLimiter.nextTokenWaitMs(uid);
-            reporter.report(OIRError.CAPABILITY_THROTTLED,
-                    "rate limit exceeded for capability " + capability
-                            + " — retry after " + waitMs + "ms");
-            return 0L;
-        }
-        return mDeps.ensurer.ensure(capability, reporter);
-    }
-
     private IOirWorker workerOrError(IOIRTokenCallback cb) {
-        IOirWorker w;
-        synchronized (mDeps.lifecycle.getLock()) { w = mDeps.lifecycle.getWorkerLocked(); }
+        IOirWorker w = workerOrNull();
         if (w == null) CallbackBridges.safeAppError(cb, OIRError.WORKER_UNAVAILABLE, "worker not attached");
         return w;
     }
 
     private IOirWorker workerOrAudioError(IOIRAudioStreamCallback cb) {
-        IOirWorker w;
-        synchronized (mDeps.lifecycle.getLock()) { w = mDeps.lifecycle.getWorkerLocked(); }
+        IOirWorker w = workerOrNull();
         if (w == null) CallbackBridges.safeAppAudioError(cb, OIRError.WORKER_UNAVAILABLE, "worker not attached");
         return w;
     }
 
     private IOirWorker workerOrBooleanError(IOIRRealtimeBooleanCallback cb) {
-        IOirWorker w;
-        synchronized (mDeps.lifecycle.getLock()) { w = mDeps.lifecycle.getWorkerLocked(); }
+        IOirWorker w = workerOrNull();
         if (w == null) CallbackBridges.safeAppBooleanError(cb, OIRError.WORKER_UNAVAILABLE, "worker not attached");
         return w;
     }

@@ -28,14 +28,12 @@ import android.util.Log;
  * the AIDL stub router stays the same shape: pick a dispatcher by
  * capability prefix, forward.
  */
-final class TextDispatcher {
+final class TextDispatcher extends NamespaceDispatcher {
 
     private static final String TAG = "OIRTextDispatcher";
 
-    private final DispatcherDeps mDeps;
-
     TextDispatcher(DispatcherDeps deps) {
-        mDeps = deps;
+        super(deps);
     }
 
     /**
@@ -192,42 +190,8 @@ final class TextDispatcher {
         return appHandle;
     }
 
-    /**
-     * Capability validate + permission + rate-limit + model-ensure pipeline
-     * shared by every submit* on this dispatcher. Returns the loaded model
-     * handle, or 0 on any failure (caller's reporter has been notified).
-     *
-     * Returning 0 means "ensurer reported a load failure"; the outer caller
-     * may want to remap the error code (e.g. text.classify wants
-     * CAPABILITY_UNAVAILABLE_NO_MODEL specifically). Preflight failures
-     * that come from this method directly (registry / permission / rate
-     * limit) leave the message accurate to the cause.
-     */
-    private long preflight(String capability, ModelEnsurer.ErrorReporter reporter) {
-        if (mDeps.registry.get(capability) == null) {
-            reporter.report(OIRError.INVALID_INPUT, "unknown capability: " + capability);
-            return 0L;
-        }
-        try {
-            mDeps.enforcer.enforce(capability, Binder.getCallingUid(), Binder.getCallingPid());
-        } catch (SecurityException se) {
-            reporter.report(OIRError.PERMISSION_DENIED, se.getMessage());
-            return 0L;
-        }
-        final int uid = Binder.getCallingUid();
-        if (!mDeps.rateLimiter.tryAcquire(uid)) {
-            long waitMs = mDeps.rateLimiter.nextTokenWaitMs(uid);
-            reporter.report(OIRError.CAPABILITY_THROTTLED,
-                    "rate limit exceeded for capability " + capability
-                            + " — retry after " + waitMs + "ms");
-            return 0L;
-        }
-        return mDeps.ensurer.ensure(capability, reporter);
-    }
-
     private IOirWorker workerOrError(IOIRTokenCallback cb) {
-        IOirWorker w;
-        synchronized (mDeps.lifecycle.getLock()) { w = mDeps.lifecycle.getWorkerLocked(); }
+        IOirWorker w = workerOrNull();
         if (w == null) {
             CallbackBridges.safeAppError(cb, OIRError.WORKER_UNAVAILABLE,
                     "worker not attached; respawn in progress");
@@ -236,8 +200,7 @@ final class TextDispatcher {
     }
 
     private IOirWorker workerOrVectorError(IOIRVectorCallback cb) {
-        IOirWorker w;
-        synchronized (mDeps.lifecycle.getLock()) { w = mDeps.lifecycle.getWorkerLocked(); }
+        IOirWorker w = workerOrNull();
         if (w == null) {
             CallbackBridges.safeAppVectorError(cb, OIRError.WORKER_UNAVAILABLE,
                     "worker not attached; respawn in progress");

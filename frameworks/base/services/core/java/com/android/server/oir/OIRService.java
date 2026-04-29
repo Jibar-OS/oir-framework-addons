@@ -288,7 +288,10 @@ public class OIRService extends SystemService {
         @Override
         public int isCapabilityRunnable(String capability) {
             if (capability == null || capability.isEmpty()) return 0;
-            Capability c = mCapabilityRegistry.get(capability);
+            // Fallback-aware: a variant that resolves to base inherits the
+            // base's runnability, matching what the dispatcher will actually
+            // do when the app calls submit on the variant.
+            Capability c = mCapabilityRegistry.getOrFallback(capability);
             if (c == null) return 0;                               // UNKNOWN_CAPABILITY
             if (c.defaultModelPath == null || c.defaultModelPath.isEmpty()) {
                 return 2;                                          // NO_DEFAULT_MODEL
@@ -333,7 +336,10 @@ public class OIRService extends SystemService {
         @Override
         public void warm(String capability) {
             if (capability == null) capability = "text.complete";
-            Capability c = mCapabilityRegistry.get(capability);
+            // Fallback-aware: warm("text.complete:fast") preloads the base
+            // model when the variant isn't declared, matching what the
+            // dispatcher will use when submit fires on the variant.
+            Capability c = mCapabilityRegistry.getOrFallback(capability);
             if (c == null) throw new IllegalArgumentException("unknown capability: " + capability);
             mEnforcer.enforce(capability, Binder.getCallingUid(), Binder.getCallingPid());
 

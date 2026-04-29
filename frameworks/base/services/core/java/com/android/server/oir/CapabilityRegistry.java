@@ -149,12 +149,18 @@ public final class CapabilityRegistry {
      * Returns the required permission for a capability, deriving from namespace
      * prefix if the XML did not declare one. Returns null for unknown capability
      * (caller should reject with CAPABILITY_NOT_FOUND).
+     *
+     * Variant fallback: uses {@link #getOrFallback} so a request for a
+     * not-declared variant ({@code text.complete:fast}) reads the base
+     * capability's required permission. Pre-this-fix, a permission lookup
+     * for a variant that fell back at every other call site still failed
+     * here with exact-match-null, so the variant was un-callable.
      */
     public String getRequiredPermission(String capabilityName) {
-        Capability c = mCapabilities.get(capabilityName);
-        if (c != null && c.requiredPermission != null) return c.requiredPermission;
-        if (c != null) return defaultPermissionForNamespace(capabilityName);
-        return null;
+        Capability c = getOrFallback(capabilityName);
+        if (c == null) return null;
+        if (c.requiredPermission != null) return c.requiredPermission;
+        return defaultPermissionForNamespace(c.name);
     }
 
     private void loadFile(File f, boolean platformAuthoritative) {
