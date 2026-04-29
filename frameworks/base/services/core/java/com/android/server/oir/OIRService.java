@@ -20,7 +20,6 @@ import android.oir.BoundingBox;
 import android.os.Binder;
 import android.os.Build;
 import android.os.Process;
-import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.os.CancellationSignal;
 import android.os.ICancellationSignal;
@@ -65,8 +64,15 @@ public class OIRService extends SystemService {
     // v0.5 V6: per-UID token-bucket rate limiter. Configured from mConfig at onStart.
     private final RateLimiter mRateLimiter = new RateLimiter();
 
-    // Worker binder lifecycle: attach/retry, mWorker holding, death recipient.
-    // Listener body runs OUTSIDE the lock; onDeath acquires it as needed.
+    // Permission enforcement (declarative perm check, registry-driven).
+    // Final but assigned in the constructor since it needs Context.
+    private final PermissionEnforcer mEnforcer;
+
+    // Worker binder lifecycle: owns the IOirWorker reference, the lock
+    // protecting compound worker-state operations, the attach/retry
+    // backoff, and the death recipient. Listener body runs OUTSIDE the
+    // lock; onDeath acquires it internally as needed. Must declare
+    // before mEnsurer (Java forward-reference rule on field initializers).
     private final WorkerLifecycle mLifecycle = new WorkerLifecycle(new WorkerLifecycle.Listener() {
         @Override public void onAttached(IOirWorker worker) {
             try {
@@ -111,9 +117,15 @@ public class OIRService extends SystemService {
         }
     });
 
+    // Single load-orchestration entry point — replaces the 7
+    // ensureXxxModelFor methods that previously lived here.
+    private final ModelEnsurer mEnsurer = new ModelEnsurer(
+            mLifecycle, mCapabilityRegistry, mHandles, mLoadDedup);
+
     public OIRService(Context context) {
         super(context);
         mContext = context;
+        mEnforcer = new PermissionEnforcer(context, mCapabilityRegistry);
     }
 
     @Override
@@ -142,556 +154,11 @@ public class OIRService extends SystemService {
 
     @Override
     public void onBootPhase(int phase) {
-        // No-op. attachWorker is triggered from onStart; onBootPhase is
-        // retained for potential future hooks (e.g., warm-up on
-        // PHASE_THIRD_PARTY_APPS_CAN_START).
+        // No-op. Worker attach is kicked from onStart via mLifecycle.start();
+        // onBootPhase is retained for potential future hooks (e.g., warm-up
+        // on PHASE_THIRD_PARTY_APPS_CAN_START).
     }
 
-    /**
-     * v0.4 lazy-load: look up or load the model for this capability.
-     * Returns worker handle, or 0 on failure (caller sends onError).
-     * Thread-safe via ConcurrentHashMap.computeIfAbsent + mWorkerLock.
-     */
-    private long ensureModelFor(String capability, IOIRTokenCallback cb) {
-        Capability c = mCapabilityRegistry.get(capability);
-        if (c == null) {
-            safeAppError(cb, OIRError.INVALID_INPUT, "unknown capability: " + capability);
-            return 0L;
-        }
-        Long existing = mHandles.get(capability);
-        if (existing != null) return existing;
-
-        // v0.6.9: only hold mWorkerLock long enough to claim a LoadFuture or
-        // read mWorker; release BEFORE the binder RPC so concurrent submits
-        // on *other* capabilities don't serialize behind our slow load.
-        // Key includes a kind prefix so a misrouted caller using a
-        // different ensure*ModelFor() for the same capability name doesn't
-        // collide with ours.
-        final String loadKey = "load:" + capability;
-        IOirWorker worker;
-        String path;
-        LoadFuture ours = null;
-        LoadFuture waitOn = null;
-        synchronized (mLifecycle.getLock()) {
-            existing = mHandles.get(capability);
-            if (existing != null) return existing;
-            if (mLifecycle.getWorkerLocked() == null) {
-                safeAppError(cb, OIRError.WORKER_UNAVAILABLE, "worker not attached");
-                return 0L;
-            }
-            waitOn = mLoadDedup.get(loadKey);
-            if (waitOn == null) {
-                path = c.defaultModelPath;
-                if (path == null || path.isEmpty()) {
-                    safeAppError(cb, OIRError.INVALID_INPUT,
-                            "capability " + capability + " has no default-model; OEM must supply");
-                    return 0L;
-                }
-                ours = new LoadFuture();
-                mLoadDedup.put(loadKey, ours);
-                worker = mLifecycle.getWorkerLocked();
-            } else {
-                worker = null;
-                path = null;
-            }
-        }
-
-        if (ours == null) {
-            // Someone else is loading; wait on their LoadFuture.
-            try {
-                long h = waitOn.awaitHandle();
-                if (h > 0) return h;
-                safeAppError(cb, OIRError.MODEL_ERROR,
-                        "concurrent load failed: " + waitOn.errMsg());
-                return 0L;
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                safeAppError(cb, OIRError.WORKER_UNAVAILABLE, "interrupted during load wait");
-                return 0L;
-            }
-        }
-
-        // We own the load. Binder RPC UNLOCKED.
-        long h = 0L;
-        String err = null;
-        try {
-            h = worker.load(path);
-            if (h <= 0) err = "worker.load returned " + h + " for " + path;
-        } catch (RemoteException e) {
-            err = "load: " + e.getMessage();
-            Log.w(TAG, "worker.load failed for " + capability, e);
-        }
-
-        synchronized (mLifecycle.getLock()) {
-            if (h > 0) mHandles.put(capability, h);
-            mLoadDedup.remove(loadKey);
-        }
-        ours.complete(h, err);
-
-        if (h <= 0) {
-            safeAppError(cb,
-                    err != null && err.startsWith("load:") ? OIRError.WORKER_UNAVAILABLE
-                                                           : OIRError.MODEL_ERROR,
-                    err != null ? err : "load failed");
-            return 0L;
-        }
-        Log.i(TAG, "lazy-loaded capability=" + capability + " handle=" + h + " path=" + path);
-        return h;
-    }
-
-    /** v0.4 H4-A: same pattern as ensureModelFor but calls mWorker.loadEmbed(). */
-    private long ensureEmbedModelFor(String capability, IOIRVectorCallback cb) {
-        Capability c = mCapabilityRegistry.get(capability);
-        if (c == null) {
-            safeAppVectorError(cb, OIRError.INVALID_INPUT, "unknown capability: " + capability);
-            return 0L;
-        }
-        Long existing = mHandles.get(capability);
-        if (existing != null) return existing;
-
-        // v0.6.9: release mWorkerLock around binder RPC (see ensureModelFor).
-        final String loadKey = "loadEmbed:" + capability;
-        IOirWorker worker;
-        String path;
-        LoadFuture ours = null;
-        LoadFuture waitOn;
-        synchronized (mLifecycle.getLock()) {
-            existing = mHandles.get(capability);
-            if (existing != null) return existing;
-            if (mLifecycle.getWorkerLocked() == null) {
-                safeAppVectorError(cb, OIRError.WORKER_UNAVAILABLE, "worker not attached");
-                return 0L;
-            }
-            waitOn = mLoadDedup.get(loadKey);
-            if (waitOn == null) {
-                path = c.defaultModelPath;
-                if (path == null || path.isEmpty()) {
-                    safeAppVectorError(cb, OIRError.INVALID_INPUT,
-                            "capability " + capability + " has no default-model; OEM must supply");
-                    return 0L;
-                }
-                ours = new LoadFuture();
-                mLoadDedup.put(loadKey, ours);
-                worker = mLifecycle.getWorkerLocked();
-            } else {
-                worker = null;
-                path = null;
-            }
-        }
-
-        if (ours == null) {
-            try {
-                long h = waitOn.awaitHandle();
-                if (h > 0) return h;
-                safeAppVectorError(cb, OIRError.MODEL_ERROR,
-                        "concurrent embed load failed: " + waitOn.errMsg());
-                return 0L;
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                safeAppVectorError(cb, OIRError.WORKER_UNAVAILABLE, "interrupted during load wait");
-                return 0L;
-            }
-        }
-
-        long h = 0L;
-        String err = null;
-        try {
-            h = worker.loadEmbed(path);
-            if (h <= 0) err = "worker.loadEmbed returned " + h + " for " + path;
-        } catch (RemoteException e) {
-            err = "loadEmbed: " + e.getMessage();
-            Log.w(TAG, "worker.loadEmbed failed for " + capability, e);
-        }
-
-        synchronized (mLifecycle.getLock()) {
-            if (h > 0) mHandles.put(capability, h);
-            mLoadDedup.remove(loadKey);
-        }
-        ours.complete(h, err);
-
-        if (h <= 0) {
-            safeAppVectorError(cb,
-                    err != null && err.startsWith("loadEmbed:") ? OIRError.WORKER_UNAVAILABLE
-                                                                : OIRError.MODEL_ERROR,
-                    err != null ? err : "loadEmbed failed");
-            return 0L;
-        }
-        Log.i(TAG, "lazy-loaded embed capability=" + capability + " handle=" + h + " path=" + path);
-        return h;
-    }
-
-    /** v0.4 H1: lazy-load whisper model for audio.* capability. */
-    private long ensureWhisperModelFor(String capability, IOIRTokenCallback cb) {
-        Capability c = mCapabilityRegistry.get(capability);
-        if (c == null) {
-            safeAppError(cb, OIRError.INVALID_INPUT, "unknown capability: " + capability);
-            return 0L;
-        }
-        Long existing = mHandles.get(capability);
-        if (existing != null) return existing;
-
-        final String loadKey = "loadWhisper:" + capability;
-        IOirWorker worker;
-        String path;
-        LoadFuture ours = null;
-        LoadFuture waitOn;
-        synchronized (mLifecycle.getLock()) {
-            existing = mHandles.get(capability);
-            if (existing != null) return existing;
-            if (mLifecycle.getWorkerLocked() == null) {
-                safeAppError(cb, OIRError.WORKER_UNAVAILABLE, "worker not attached");
-                return 0L;
-            }
-            waitOn = mLoadDedup.get(loadKey);
-            if (waitOn == null) {
-                path = c.defaultModelPath;
-                if (path == null || path.isEmpty()) {
-                    safeAppError(cb, OIRError.INVALID_INPUT,
-                            "capability " + capability + " has no default-model; OEM must supply");
-                    return 0L;
-                }
-                ours = new LoadFuture();
-                mLoadDedup.put(loadKey, ours);
-                worker = mLifecycle.getWorkerLocked();
-            } else {
-                worker = null;
-                path = null;
-            }
-        }
-
-        if (ours == null) {
-            try {
-                long h = waitOn.awaitHandle();
-                if (h > 0) return h;
-                safeAppError(cb, OIRError.MODEL_ERROR,
-                        "concurrent whisper load failed: " + waitOn.errMsg());
-                return 0L;
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                safeAppError(cb, OIRError.WORKER_UNAVAILABLE, "interrupted during load wait");
-                return 0L;
-            }
-        }
-
-        long h = 0L;
-        String err = null;
-        try {
-            h = worker.loadWhisper(path);
-            if (h <= 0) err = "worker.loadWhisper returned " + h + " for " + path;
-        } catch (RemoteException e) {
-            err = "loadWhisper: " + e.getMessage();
-            Log.w(TAG, "worker.loadWhisper failed for " + capability, e);
-        }
-
-        synchronized (mLifecycle.getLock()) {
-            if (h > 0) mHandles.put(capability, h);
-            mLoadDedup.remove(loadKey);
-        }
-        ours.complete(h, err);
-
-        if (h <= 0) {
-            safeAppError(cb,
-                    err != null && err.startsWith("loadWhisper:") ? OIRError.WORKER_UNAVAILABLE
-                                                                  : OIRError.MODEL_ERROR,
-                    err != null ? err : "loadWhisper failed");
-            return 0L;
-        }
-        Log.i(TAG, "lazy-loaded whisper capability=" + capability + " handle=" + h + " path=" + path);
-        return h;
-    }
-
-    /**
-     * v0.4 H2/H3: lazy-load ONNX model. isDetection toggles ORT session
-     * options (aggressive graph optimization for detect vs. conservative
-     * for synth). Errors go through the provided callback, which is either
-     * IOIRAudioStreamCallback (synth) or IOIRBoundingBoxCallback (detect);
-     * callers use the right safeApp*Error wrapper.
-     */
-    private long ensureOnnxModelFor(String capability, boolean isDetection) {
-        Capability c = mCapabilityRegistry.get(capability);
-        if (c == null) return 0L;
-        Long existing = mHandles.get(capability);
-        if (existing != null) return existing;
-
-        final String loadKey = (isDetection ? "loadOnnxDet:" : "loadOnnxSynth:") + capability;
-        IOirWorker worker;
-        String path;
-        LoadFuture ours = null;
-        LoadFuture waitOn;
-        synchronized (mLifecycle.getLock()) {
-            existing = mHandles.get(capability);
-            if (existing != null) return existing;
-            if (mLifecycle.getWorkerLocked() == null) return 0L;
-            waitOn = mLoadDedup.get(loadKey);
-            if (waitOn == null) {
-                path = c.defaultModelPath;
-                if (path == null || path.isEmpty()) return 0L;
-                ours = new LoadFuture();
-                mLoadDedup.put(loadKey, ours);
-                worker = mLifecycle.getWorkerLocked();
-            } else {
-                worker = null;
-                path = null;
-            }
-        }
-
-        if (ours == null) {
-            try {
-                return waitOn.awaitHandle();
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                return 0L;
-            }
-        }
-
-        long h = 0L;
-        String err = null;
-        try {
-            h = worker.loadOnnx(path, isDetection);
-            if (h <= 0) err = "loadOnnx returned " + h;
-        } catch (RemoteException e) {
-            err = "loadOnnx: " + e.getMessage();
-            Log.w(TAG, "worker.loadOnnx failed for " + capability, e);
-        }
-
-        synchronized (mLifecycle.getLock()) {
-            if (h > 0) mHandles.put(capability, h);
-            mLoadDedup.remove(loadKey);
-        }
-        ours.complete(h, err);
-
-        if (h <= 0) return 0L;
-        Log.i(TAG, "lazy-loaded onnx capability=" + capability
-                + " kind=" + (isDetection ? "detect" : "synth")
-                + " handle=" + h + " path=" + path);
-        return h;
-    }
-
-    /** v0.5 V5: lazy-load audio.vad ONNX (Silero). */
-    private long ensureVadModelFor(String capability) {
-        Capability c = mCapabilityRegistry.get(capability);
-        if (c == null) return 0L;
-        Long existing = mHandles.get(capability);
-        if (existing != null) return existing;
-
-        final String loadKey = "loadVad:" + capability;
-        IOirWorker worker;
-        String path;
-        LoadFuture ours = null;
-        LoadFuture waitOn;
-        synchronized (mLifecycle.getLock()) {
-            existing = mHandles.get(capability);
-            if (existing != null) return existing;
-            if (mLifecycle.getWorkerLocked() == null) return 0L;
-            waitOn = mLoadDedup.get(loadKey);
-            if (waitOn == null) {
-                path = c.defaultModelPath;
-                if (path == null || path.isEmpty()) return 0L;
-                ours = new LoadFuture();
-                mLoadDedup.put(loadKey, ours);
-                worker = mLifecycle.getWorkerLocked();
-            } else {
-                worker = null;
-                path = null;
-            }
-        }
-
-        if (ours == null) {
-            try {
-                return waitOn.awaitHandle();
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                return 0L;
-            }
-        }
-
-        long h = 0L;
-        String err = null;
-        try {
-            h = worker.loadVad(path);
-            if (h <= 0) err = "loadVad returned " + h;
-        } catch (RemoteException e) {
-            err = "loadVad: " + e.getMessage();
-            Log.w(TAG, "worker.loadVad failed for " + capability, e);
-        }
-
-        synchronized (mLifecycle.getLock()) {
-            if (h > 0) mHandles.put(capability, h);
-            mLoadDedup.remove(loadKey);
-        }
-        ours.complete(h, err);
-
-        if (h <= 0) return 0L;
-        Log.i(TAG, "lazy-loaded vad capability=" + capability + " handle=" + h + " path=" + path);
-        return h;
-    }
-
-    /** v0.4 H6: lazy-load VLM. capability.defaultModelPath is pipe-delimited "clip|llm". */
-    private long ensureVlmModelFor(String capability, IOIRTokenCallback cb) {
-        Capability c = mCapabilityRegistry.get(capability);
-        if (c == null) {
-            safeAppError(cb, OIRError.INVALID_INPUT, "unknown capability: " + capability);
-            return 0L;
-        }
-        Long existing = mHandles.get(capability);
-        if (existing != null) return existing;
-
-        final String loadKey = "loadVlm:" + capability;
-        IOirWorker worker;
-        String clipPath;
-        String llmPath;
-        LoadFuture ours = null;
-        LoadFuture waitOn;
-        synchronized (mLifecycle.getLock()) {
-            existing = mHandles.get(capability);
-            if (existing != null) return existing;
-            if (mLifecycle.getWorkerLocked() == null) {
-                safeAppError(cb, OIRError.WORKER_UNAVAILABLE, "worker not attached");
-                return 0L;
-            }
-            waitOn = mLoadDedup.get(loadKey);
-            if (waitOn == null) {
-                String path = c.defaultModelPath;
-                if (path == null || path.isEmpty() || !path.contains("|")) {
-                    safeAppError(cb, OIRError.INVALID_INPUT,
-                            "vision.describe default-model must be pipe-delimited 'clip|llm': got '"
-                                    + path + "'");
-                    return 0L;
-                }
-                int bar = path.indexOf('|');
-                clipPath = path.substring(0, bar);
-                llmPath = path.substring(bar + 1);
-                ours = new LoadFuture();
-                mLoadDedup.put(loadKey, ours);
-                worker = mLifecycle.getWorkerLocked();
-            } else {
-                worker = null;
-                clipPath = null;
-                llmPath = null;
-            }
-        }
-
-        if (ours == null) {
-            try {
-                long h = waitOn.awaitHandle();
-                if (h > 0) return h;
-                safeAppError(cb, OIRError.MODEL_ERROR,
-                        "concurrent VLM load failed: " + waitOn.errMsg());
-                return 0L;
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                safeAppError(cb, OIRError.WORKER_UNAVAILABLE, "interrupted during load wait");
-                return 0L;
-            }
-        }
-
-        long h = 0L;
-        String err = null;
-        try {
-            h = worker.loadVlm(clipPath, llmPath);
-            if (h <= 0) err = "worker.loadVlm returned " + h;
-        } catch (RemoteException e) {
-            err = "loadVlm: " + e.getMessage();
-            Log.w(TAG, "worker.loadVlm failed for " + capability, e);
-        }
-
-        synchronized (mLifecycle.getLock()) {
-            if (h > 0) mHandles.put(capability, h);
-            mLoadDedup.remove(loadKey);
-        }
-        ours.complete(h, err);
-
-        if (h <= 0) {
-            safeAppError(cb,
-                    err != null && err.startsWith("loadVlm:") ? OIRError.WORKER_UNAVAILABLE
-                                                              : OIRError.MODEL_ERROR,
-                    err != null ? err : "loadVlm failed");
-            return 0L;
-        }
-        Log.i(TAG, "lazy-loaded VLM capability=" + capability + " handle=" + h
-                + " clip=" + clipPath + " llm=" + llmPath);
-        return h;
-    }
-
-    /** v0.4 H4-B: lazy-load vision encoder (SigLIP/CLIP ONNX). */
-    private long ensureVisionEmbedModelFor(String capability, IOIRVectorCallback cb) {
-        Capability c = mCapabilityRegistry.get(capability);
-        if (c == null) {
-            safeAppVectorError(cb, OIRError.INVALID_INPUT, "unknown capability: " + capability);
-            return 0L;
-        }
-        Long existing = mHandles.get(capability);
-        if (existing != null) return existing;
-
-        final String loadKey = "loadVisionEmbed:" + capability;
-        IOirWorker worker;
-        String path;
-        LoadFuture ours = null;
-        LoadFuture waitOn;
-        synchronized (mLifecycle.getLock()) {
-            existing = mHandles.get(capability);
-            if (existing != null) return existing;
-            if (mLifecycle.getWorkerLocked() == null) {
-                safeAppVectorError(cb, OIRError.WORKER_UNAVAILABLE, "worker not attached");
-                return 0L;
-            }
-            waitOn = mLoadDedup.get(loadKey);
-            if (waitOn == null) {
-                path = c.defaultModelPath;
-                if (path == null || path.isEmpty()) {
-                    safeAppVectorError(cb, OIRError.INVALID_INPUT,
-                            "capability " + capability + " has no default-model; OEM must supply");
-                    return 0L;
-                }
-                ours = new LoadFuture();
-                mLoadDedup.put(loadKey, ours);
-                worker = mLifecycle.getWorkerLocked();
-            } else {
-                worker = null;
-                path = null;
-            }
-        }
-
-        if (ours == null) {
-            try {
-                long h = waitOn.awaitHandle();
-                if (h > 0) return h;
-                safeAppVectorError(cb, OIRError.MODEL_ERROR,
-                        "concurrent vision-embed load failed: " + waitOn.errMsg());
-                return 0L;
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                safeAppVectorError(cb, OIRError.WORKER_UNAVAILABLE, "interrupted during load wait");
-                return 0L;
-            }
-        }
-
-        long h = 0L;
-        String err = null;
-        try {
-            h = worker.loadVisionEmbed(path);
-            if (h <= 0) err = "worker.loadVisionEmbed returned " + h + " for " + path;
-        } catch (RemoteException e) {
-            err = "loadVisionEmbed: " + e.getMessage();
-            Log.w(TAG, "worker.loadVisionEmbed failed for " + capability, e);
-        }
-
-        synchronized (mLifecycle.getLock()) {
-            if (h > 0) mHandles.put(capability, h);
-            mLoadDedup.remove(loadKey);
-        }
-        ours.complete(h, err);
-
-        if (h <= 0) {
-            safeAppVectorError(cb,
-                    err != null && err.startsWith("loadVisionEmbed:") ? OIRError.WORKER_UNAVAILABLE
-                                                                      : OIRError.MODEL_ERROR,
-                    err != null ? err : "loadVisionEmbed failed");
-            return 0L;
-        }
-        Log.i(TAG, "lazy-loaded vision embed capability=" + capability + " handle=" + h + " path=" + path);
-        return h;
-    }
 
     private final IOIRService.Stub mBinder = new IOIRService.Stub() {
 
@@ -700,25 +167,25 @@ public class OIRService extends SystemService {
                 IOIRTokenCallback appCallback, ICancellationSignal cancel) {
             if (capability == null || capability.isEmpty()) capability = "text.complete";
             if (mCapabilityRegistry.get(capability) == null) {
-                safeAppError(appCallback, OIRError.INVALID_INPUT, "unknown capability: " + capability);
+                CallbackBridges.safeAppError(appCallback, OIRError.INVALID_INPUT, "unknown capability: " + capability);
                 return 0L;
             }
             try {
-                enforceOirPermission(capability, Binder.getCallingUid(), Binder.getCallingPid());
+                mEnforcer.enforce(capability, Binder.getCallingUid(), Binder.getCallingPid());
             } catch (SecurityException se) {
-                safeAppError(appCallback, OIRError.PERMISSION_DENIED, se.getMessage());
+                CallbackBridges.safeAppError(appCallback, OIRError.PERMISSION_DENIED, se.getMessage());
                 return 0L;
             }
 
             // v0.5 V6: per-UID rate limit check.
             if (!mRateLimiter.tryAcquire(Binder.getCallingUid())) {
-                safeAppError(appCallback, OIRError.CAPABILITY_THROTTLED,
+                CallbackBridges.safeAppError(appCallback, OIRError.CAPABILITY_THROTTLED,
                         "rate limit exceeded for capability " + capability);
                 return 0L;
             }
 
             if (prompt == null || prompt.isEmpty()) {
-                safeAppError(appCallback, OIRError.INVALID_INPUT, "prompt is empty");
+                CallbackBridges.safeAppError(appCallback, OIRError.INVALID_INPUT, "prompt is empty");
                 return 0L;
             }
 
@@ -732,12 +199,12 @@ public class OIRService extends SystemService {
                     imagePath = prompt.substring(0, bar);
                     userPrompt = prompt.substring(bar + 3);
                 }
-                final long vlmHandle = ensureVlmModelFor(capability, appCallback);
+                final long vlmHandle = mEnsurer.ensure(capability, CallbackBridges.forToken(appCallback));
                 if (vlmHandle == 0L) return 0L;
                 final IOirWorker vw;
                 synchronized (mLifecycle.getLock()) { vw = mLifecycle.getWorkerLocked(); }
                 if (vw == null) {
-                    safeAppError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
+                    CallbackBridges.safeAppError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
                     return 0L;
                 }
                 final long appHandleD = mNextRequestHandle.getAndIncrement();
@@ -756,11 +223,11 @@ public class OIRService extends SystemService {
                     long workerHandle = vw.submitDescribeImage(vlmHandle, imagePath, userPrompt,
                             new WorkerCallbackBridge(appHandleD, appCallback));
                     mAppHandleToWorkerHandle.put(appHandleD, workerHandle);
-                    wireCancellationSignal(cancel, appHandleD);
+                    CallbackBridges.wireCancellationSignal(cancel, appHandleD, mBinder::cancel);
                     return appHandleD;
                 } catch (RemoteException e) {
                     Log.w(TAG, "submitDescribeImage failed app=" + appHandleD, e);
-                    safeAppError(appCallback, OIRError.WORKER_UNAVAILABLE, "submitDescribeImage: " + e.getMessage());
+                    CallbackBridges.safeAppError(appCallback, OIRError.WORKER_UNAVAILABLE, "submitDescribeImage: " + e.getMessage());
                     return 0L;
                 }
             }
@@ -796,7 +263,7 @@ public class OIRService extends SystemService {
                 if (capability.startsWith("audio.synthesize")) correctApi = "submitSynthesize";
                 else if (capability.startsWith("audio.vad"))   correctApi = "submitVad";
                 else                                           correctApi = "the capability-typed submit method";
-                safeAppError(appCallback, OIRError.INVALID_INPUT,
+                CallbackBridges.safeAppError(appCallback, OIRError.INVALID_INPUT,
                         "capability '" + capability + "' is not a token-stream shape; "
                                 + "use " + correctApi + " instead of submit()");
                 return 0L;
@@ -805,12 +272,12 @@ public class OIRService extends SystemService {
             // audio.transcribe routes to whisper; prompt carries audio file path.
             if (capability.equals("audio.transcribe")
                     || capability.startsWith("audio.transcribe:")) {
-                final long whisperHandle = ensureWhisperModelFor(capability, appCallback);
+                final long whisperHandle = mEnsurer.ensure(capability, CallbackBridges.forToken(appCallback));
                 if (whisperHandle == 0L) return 0L;
                 final IOirWorker wworker;
                 synchronized (mLifecycle.getLock()) { wworker = mLifecycle.getWorkerLocked(); }
                 if (wworker == null) {
-                    safeAppError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
+                    CallbackBridges.safeAppError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
                     return 0L;
                 }
                 final long appHandleA = mNextRequestHandle.getAndIncrement();
@@ -827,24 +294,24 @@ public class OIRService extends SystemService {
                     long workerHandle = wworker.submitTranscribe(whisperHandle, prompt,
                             new WorkerCallbackBridge(appHandleA, appCallback));
                     mAppHandleToWorkerHandle.put(appHandleA, workerHandle);
-                    wireCancellationSignal(cancel, appHandleA);
+                    CallbackBridges.wireCancellationSignal(cancel, appHandleA, mBinder::cancel);
                     return appHandleA;
                 } catch (RemoteException e) {
                     Log.w(TAG, "submitTranscribe failed app=" + appHandleA, e);
-                    safeAppError(appCallback, OIRError.WORKER_UNAVAILABLE, "submitTranscribe: " + e.getMessage());
+                    CallbackBridges.safeAppError(appCallback, OIRError.WORKER_UNAVAILABLE, "submitTranscribe: " + e.getMessage());
                     return 0L;
                 }
             }
 
-            final long modelHandle = ensureModelFor(capability, appCallback);
-            if (modelHandle == 0L) return 0L;  // error already reported by ensureModelFor
+            final long modelHandle = mEnsurer.ensure(capability, CallbackBridges.forToken(appCallback));
+            if (modelHandle == 0L) return 0L;  // error already reported via the callback
             final IOirWorker worker;
             synchronized (mLifecycle.getLock()) {
                 worker = mLifecycle.getWorkerLocked();
             }
 
             if (worker == null) {
-                safeAppError(appCallback, OIRError.WORKER_UNAVAILABLE,
+                CallbackBridges.safeAppError(appCallback, OIRError.WORKER_UNAVAILABLE,
                         "worker not attached; respawn in progress");
                 return 0L;
             }
@@ -883,10 +350,10 @@ public class OIRService extends SystemService {
 
                 // v0.6.1: use the shared helper so cancellation semantics
                 // stay uniform across every submit* method.
-                wireCancellationSignal(cancel, appHandle);
+                CallbackBridges.wireCancellationSignal(cancel, appHandle, mBinder::cancel);
             } catch (RemoteException e) {
                 Log.w(TAG, "worker.submit failed app=" + appHandle, e);
-                safeAppError(appCallback, OIRError.MODEL_ERROR,
+                CallbackBridges.safeAppError(appCallback, OIRError.MODEL_ERROR,
                         "worker.submit failed: " + e.getMessage());
                 return 0L;
             }
@@ -912,34 +379,34 @@ public class OIRService extends SystemService {
                 IOIRVectorCallback appCallback, ICancellationSignal cancel) {
             if (capability == null || capability.isEmpty()) capability = "text.embed";
             if (mCapabilityRegistry.get(capability) == null) {
-                safeAppVectorError(appCallback, OIRError.INVALID_INPUT, "unknown capability: " + capability);
+                CallbackBridges.safeAppVectorError(appCallback, OIRError.INVALID_INPUT, "unknown capability: " + capability);
                 return 0L;
             }
             try {
-                enforceOirPermission(capability, Binder.getCallingUid(), Binder.getCallingPid());
+                mEnforcer.enforce(capability, Binder.getCallingUid(), Binder.getCallingPid());
             } catch (SecurityException se) {
-                safeAppVectorError(appCallback, OIRError.PERMISSION_DENIED, se.getMessage());
+                CallbackBridges.safeAppVectorError(appCallback, OIRError.PERMISSION_DENIED, se.getMessage());
                 return 0L;
             }
             // v0.5 V6: per-UID rate limit check.
             if (!mRateLimiter.tryAcquire(Binder.getCallingUid())) {
-                safeAppVectorError(appCallback, OIRError.CAPABILITY_THROTTLED,
+                CallbackBridges.safeAppVectorError(appCallback, OIRError.CAPABILITY_THROTTLED,
                         "rate limit exceeded for capability " + capability);
                 return 0L;
             }
             if (text == null || text.isEmpty()) {
-                safeAppVectorError(appCallback, OIRError.INVALID_INPUT, "text is empty");
+                CallbackBridges.safeAppVectorError(appCallback, OIRError.INVALID_INPUT, "text is empty");
                 return 0L;
             }
 
             // v0.4 H4-B: vision.embed routes to vision encoder (text carries imagePath).
             if (capability.startsWith("vision.embed")) {
-                final long vHandle = ensureVisionEmbedModelFor(capability, appCallback);
+                final long vHandle = mEnsurer.ensure(capability, CallbackBridges.forVector(appCallback));
                 if (vHandle == 0L) return 0L;
                 final IOirWorker vw;
                 synchronized (mLifecycle.getLock()) { vw = mLifecycle.getWorkerLocked(); }
                 if (vw == null) {
-                    safeAppVectorError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
+                    CallbackBridges.safeAppVectorError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
                     return 0L;
                 }
                 final long appHandleV = mNextRequestHandle.getAndIncrement();
@@ -947,10 +414,10 @@ public class OIRService extends SystemService {
                     long workerHandle = vw.submitVisionEmbed(vHandle, text,
                             new WorkerVectorCallbackBridge(appHandleV, appCallback));
                     mAppHandleToWorkerHandle.put(appHandleV, workerHandle);
-                    wireCancellationSignal(cancel, appHandleV);
+                    CallbackBridges.wireCancellationSignal(cancel, appHandleV, mBinder::cancel);
                     return appHandleV;
                 } catch (RemoteException e) {
-                    safeAppVectorError(appCallback, OIRError.WORKER_UNAVAILABLE, "submitVisionEmbed: " + e.getMessage());
+                    CallbackBridges.safeAppVectorError(appCallback, OIRError.WORKER_UNAVAILABLE, "submitVisionEmbed: " + e.getMessage());
                     return 0L;
                 }
             }
@@ -963,9 +430,9 @@ public class OIRService extends SystemService {
             // or /vendor/ overrides. Surface NO_MODEL cleanly so apps can
             // feature-detect.
             if (capability.startsWith("text.classify")) {
-                final long cHandle = ensureOnnxModelFor(capability, /*isDetection=*/false);
+                final long cHandle = mEnsurer.ensure(capability, ModelEnsurer.NO_REPORTER);
                 if (cHandle == 0L) {
-                    safeAppVectorError(appCallback,
+                    CallbackBridges.safeAppVectorError(appCallback,
                             OIRError.CAPABILITY_UNAVAILABLE_NO_MODEL,
                             "no default classifier for " + capability
                                     + " — OEM must bake-in via /product/etc/oir/");
@@ -974,7 +441,7 @@ public class OIRService extends SystemService {
                 final IOirWorker cw;
                 synchronized (mLifecycle.getLock()) { cw = mLifecycle.getWorkerLocked(); }
                 if (cw == null) {
-                    safeAppVectorError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
+                    CallbackBridges.safeAppVectorError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
                     return 0L;
                 }
                 final long appHandleC = mNextRequestHandle.getAndIncrement();
@@ -982,21 +449,21 @@ public class OIRService extends SystemService {
                     long workerHandle = cw.submitClassify(cHandle, text,
                             new WorkerVectorCallbackBridge(appHandleC, appCallback));
                     mAppHandleToWorkerHandle.put(appHandleC, workerHandle);
-                    wireCancellationSignal(cancel, appHandleC);
+                    CallbackBridges.wireCancellationSignal(cancel, appHandleC, mBinder::cancel);
                     return appHandleC;
                 } catch (RemoteException e) {
                     Log.w(TAG, "submitClassify failed app=" + appHandleC, e);
-                    safeAppVectorError(appCallback, OIRError.WORKER_UNAVAILABLE, "submitClassify: " + e.getMessage());
+                    CallbackBridges.safeAppVectorError(appCallback, OIRError.WORKER_UNAVAILABLE, "submitClassify: " + e.getMessage());
                     return 0L;
                 }
             }
 
-            final long modelHandle = ensureEmbedModelFor(capability, appCallback);
+            final long modelHandle = mEnsurer.ensure(capability, CallbackBridges.forVector(appCallback));
             if (modelHandle == 0L) return 0L;
             final IOirWorker worker;
             synchronized (mLifecycle.getLock()) { worker = mLifecycle.getWorkerLocked(); }
             if (worker == null) {
-                safeAppVectorError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
+                CallbackBridges.safeAppVectorError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
                 return 0L;
             }
 
@@ -1005,11 +472,11 @@ public class OIRService extends SystemService {
                 long workerHandle = worker.submitEmbed(modelHandle, text,
                         new WorkerVectorCallbackBridge(appHandle, appCallback));
                 mAppHandleToWorkerHandle.put(appHandle, workerHandle);
-                wireCancellationSignal(cancel, appHandle);
+                CallbackBridges.wireCancellationSignal(cancel, appHandle, mBinder::cancel);
                 return appHandle;
             } catch (RemoteException e) {
                 Log.w(TAG, "submitEmbed failed app=" + appHandle, e);
-                safeAppVectorError(appCallback, OIRError.WORKER_UNAVAILABLE, "submitEmbed: " + e.getMessage());
+                CallbackBridges.safeAppVectorError(appCallback, OIRError.WORKER_UNAVAILABLE, "submitEmbed: " + e.getMessage());
                 return 0L;
             }
         }
@@ -1020,38 +487,38 @@ public class OIRService extends SystemService {
             if (capability == null || capability.isEmpty()) capability = "audio.synthesize";
             Capability c = mCapabilityRegistry.get(capability);
             if (c == null) {
-                safeAppAudioError(appCallback, OIRError.INVALID_INPUT, "unknown capability: " + capability);
+                CallbackBridges.safeAppAudioError(appCallback, OIRError.INVALID_INPUT, "unknown capability: " + capability);
                 return 0L;
             }
             try {
-                enforceOirPermission(capability, Binder.getCallingUid(), Binder.getCallingPid());
+                mEnforcer.enforce(capability, Binder.getCallingUid(), Binder.getCallingPid());
             } catch (SecurityException se) {
-                safeAppAudioError(appCallback, OIRError.PERMISSION_DENIED, se.getMessage());
+                CallbackBridges.safeAppAudioError(appCallback, OIRError.PERMISSION_DENIED, se.getMessage());
                 return 0L;
             }
             // v0.5 V6: per-UID rate limit check.
             if (!mRateLimiter.tryAcquire(Binder.getCallingUid())) {
-                safeAppAudioError(appCallback, OIRError.CAPABILITY_THROTTLED,
+                CallbackBridges.safeAppAudioError(appCallback, OIRError.CAPABILITY_THROTTLED,
                         "rate limit exceeded for capability " + capability);
                 return 0L;
             }
             if (text == null || text.isEmpty()) {
-                safeAppAudioError(appCallback, OIRError.INVALID_INPUT, "text is empty");
+                CallbackBridges.safeAppAudioError(appCallback, OIRError.INVALID_INPUT, "text is empty");
                 return 0L;
             }
-            final long modelHandle = ensureOnnxModelFor(capability, /*isDetection=*/false);
+            final long modelHandle = mEnsurer.ensure(capability, ModelEnsurer.NO_REPORTER);
             if (modelHandle == 0L) {
                 // v0.6.1 audit: was MODEL_ERROR. The typed NO_MODEL error
                 // is the whole point of the "declared but unbacked"
                 // capability pattern — apps feature-detect on this code.
-                safeAppAudioError(appCallback, OIRError.CAPABILITY_UNAVAILABLE_NO_MODEL,
+                CallbackBridges.safeAppAudioError(appCallback, OIRError.CAPABILITY_UNAVAILABLE_NO_MODEL,
                         "no synth model for " + capability + " (OEM must bake-in)");
                 return 0L;
             }
             final IOirWorker worker;
             synchronized (mLifecycle.getLock()) { worker = mLifecycle.getWorkerLocked(); }
             if (worker == null) {
-                safeAppAudioError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
+                CallbackBridges.safeAppAudioError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
                 return 0L;
             }
             final long appHandle = mNextRequestHandle.getAndIncrement();
@@ -1059,11 +526,11 @@ public class OIRService extends SystemService {
                 long workerHandle = worker.submitSynthesize(modelHandle, text,
                         new WorkerAudioCallbackBridge(appHandle, appCallback));
                 mAppHandleToWorkerHandle.put(appHandle, workerHandle);
-                wireCancellationSignal(cancel, appHandle);
+                CallbackBridges.wireCancellationSignal(cancel, appHandle, mBinder::cancel);
                 return appHandle;
             } catch (RemoteException e) {
                 Log.w(TAG, "submitSynthesize failed app=" + appHandle, e);
-                safeAppAudioError(appCallback, OIRError.WORKER_UNAVAILABLE, "submitSynthesize: " + e.getMessage());
+                CallbackBridges.safeAppAudioError(appCallback, OIRError.WORKER_UNAVAILABLE, "submitSynthesize: " + e.getMessage());
                 return 0L;
             }
         }
@@ -1074,23 +541,23 @@ public class OIRService extends SystemService {
             if (capability == null || capability.isEmpty()) capability = "vision.detect";
             Capability c = mCapabilityRegistry.get(capability);
             if (c == null) {
-                safeAppBboxError(appCallback, OIRError.INVALID_INPUT, "unknown capability: " + capability);
+                CallbackBridges.safeAppBboxError(appCallback, OIRError.INVALID_INPUT, "unknown capability: " + capability);
                 return 0L;
             }
             try {
-                enforceOirPermission(capability, Binder.getCallingUid(), Binder.getCallingPid());
+                mEnforcer.enforce(capability, Binder.getCallingUid(), Binder.getCallingPid());
             } catch (SecurityException se) {
-                safeAppBboxError(appCallback, OIRError.PERMISSION_DENIED, se.getMessage());
+                CallbackBridges.safeAppBboxError(appCallback, OIRError.PERMISSION_DENIED, se.getMessage());
                 return 0L;
             }
             // v0.5 V6: per-UID rate limit check.
             if (!mRateLimiter.tryAcquire(Binder.getCallingUid())) {
-                safeAppBboxError(appCallback, OIRError.CAPABILITY_THROTTLED,
+                CallbackBridges.safeAppBboxError(appCallback, OIRError.CAPABILITY_THROTTLED,
                         "rate limit exceeded for capability " + capability);
                 return 0L;
             }
             if (imagePath == null || imagePath.isEmpty()) {
-                safeAppBboxError(appCallback, OIRError.INVALID_INPUT, "imagePath is empty");
+                CallbackBridges.safeAppBboxError(appCallback, OIRError.INVALID_INPUT, "imagePath is empty");
                 return 0L;
             }
 
@@ -1101,9 +568,9 @@ public class OIRService extends SystemService {
             // unbacked so apps see NO_MODEL cleanly until OEM bakes.
             final boolean isOcr = capability.equals("vision.ocr")
                     || capability.startsWith("vision.ocr:");
-            final long modelHandle = ensureOnnxModelFor(capability, /*isDetection=*/true);
+            final long modelHandle = mEnsurer.ensure(capability, ModelEnsurer.NO_REPORTER);
             if (modelHandle == 0L) {
-                safeAppBboxError(appCallback,
+                CallbackBridges.safeAppBboxError(appCallback,
                         isOcr ? OIRError.CAPABILITY_UNAVAILABLE_NO_MODEL
                               : OIRError.MODEL_ERROR,
                         (isOcr ? "no OCR model for " : "no detect model for ")
@@ -1113,7 +580,7 @@ public class OIRService extends SystemService {
             final IOirWorker worker;
             synchronized (mLifecycle.getLock()) { worker = mLifecycle.getWorkerLocked(); }
             if (worker == null) {
-                safeAppBboxError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
+                CallbackBridges.safeAppBboxError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
                 return 0L;
             }
             final long appHandle = mNextRequestHandle.getAndIncrement();
@@ -1127,12 +594,12 @@ public class OIRService extends SystemService {
                             new WorkerBboxCallbackBridge(appHandle, appCallback));
                 }
                 mAppHandleToWorkerHandle.put(appHandle, workerHandle);
-                wireCancellationSignal(cancel, appHandle);
+                CallbackBridges.wireCancellationSignal(cancel, appHandle, mBinder::cancel);
                 return appHandle;
             } catch (RemoteException e) {
                 Log.w(TAG, (isOcr ? "submitOcr" : "submitDetect")
                         + " failed app=" + appHandle, e);
-                safeAppBboxError(appCallback, OIRError.WORKER_UNAVAILABLE,
+                CallbackBridges.safeAppBboxError(appCallback, OIRError.WORKER_UNAVAILABLE,
                         (isOcr ? "submitOcr: " : "submitDetect: ") + e.getMessage());
                 return 0L;
             }
@@ -1144,34 +611,34 @@ public class OIRService extends SystemService {
             if (capability == null || capability.isEmpty()) capability = "audio.vad";
             Capability c = mCapabilityRegistry.get(capability);
             if (c == null) {
-                safeAppBooleanError(appCallback, OIRError.INVALID_INPUT, "unknown capability: " + capability);
+                CallbackBridges.safeAppBooleanError(appCallback, OIRError.INVALID_INPUT, "unknown capability: " + capability);
                 return 0L;
             }
             try {
-                enforceOirPermission(capability, Binder.getCallingUid(), Binder.getCallingPid());
+                mEnforcer.enforce(capability, Binder.getCallingUid(), Binder.getCallingPid());
             } catch (SecurityException se) {
-                safeAppBooleanError(appCallback, OIRError.PERMISSION_DENIED, se.getMessage());
+                CallbackBridges.safeAppBooleanError(appCallback, OIRError.PERMISSION_DENIED, se.getMessage());
                 return 0L;
             }
             if (!mRateLimiter.tryAcquire(Binder.getCallingUid())) {
-                safeAppBooleanError(appCallback, OIRError.CAPABILITY_THROTTLED,
+                CallbackBridges.safeAppBooleanError(appCallback, OIRError.CAPABILITY_THROTTLED,
                         "rate limit exceeded for capability " + capability);
                 return 0L;
             }
             if (pcmPath == null || pcmPath.isEmpty()) {
-                safeAppBooleanError(appCallback, OIRError.INVALID_INPUT, "pcmPath is empty");
+                CallbackBridges.safeAppBooleanError(appCallback, OIRError.INVALID_INPUT, "pcmPath is empty");
                 return 0L;
             }
-            final long modelHandle = ensureVadModelFor(capability);
+            final long modelHandle = mEnsurer.ensure(capability, ModelEnsurer.NO_REPORTER);
             if (modelHandle == 0L) {
-                safeAppBooleanError(appCallback, OIRError.CAPABILITY_UNAVAILABLE_NO_MODEL,
+                CallbackBridges.safeAppBooleanError(appCallback, OIRError.CAPABILITY_UNAVAILABLE_NO_MODEL,
                         "no vad model resolvable for " + capability);
                 return 0L;
             }
             final IOirWorker worker;
             synchronized (mLifecycle.getLock()) { worker = mLifecycle.getWorkerLocked(); }
             if (worker == null) {
-                safeAppBooleanError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
+                CallbackBridges.safeAppBooleanError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
                 return 0L;
             }
             final long appHandle = mNextRequestHandle.getAndIncrement();
@@ -1179,10 +646,10 @@ public class OIRService extends SystemService {
                 long workerHandle = worker.submitVad(modelHandle, pcmPath,
                         new WorkerRealtimeBooleanCallbackBridge(appHandle, appCallback));
                 mAppHandleToWorkerHandle.put(appHandle, workerHandle);
-                wireCancellationSignal(cancel, appHandle);
+                CallbackBridges.wireCancellationSignal(cancel, appHandle, mBinder::cancel);
             } catch (RemoteException e) {
                 Log.w(TAG, "submitVad failed app=" + appHandle, e);
-                safeAppBooleanError(appCallback, OIRError.WORKER_UNAVAILABLE, "submitVad: " + e.getMessage());
+                CallbackBridges.safeAppBooleanError(appCallback, OIRError.WORKER_UNAVAILABLE, "submitVad: " + e.getMessage());
                 return 0L;
             }
             Log.i(TAG, "submitVad app=" + appHandle + " uid=" + Binder.getCallingUid()
@@ -1197,38 +664,38 @@ public class OIRService extends SystemService {
             if (capability == null || capability.isEmpty()) capability = "text.rerank";
             Capability c = mCapabilityRegistry.get(capability);
             if (c == null) {
-                safeAppVectorError(appCallback, OIRError.INVALID_INPUT, "unknown capability: " + capability);
+                CallbackBridges.safeAppVectorError(appCallback, OIRError.INVALID_INPUT, "unknown capability: " + capability);
                 return 0L;
             }
             try {
-                enforceOirPermission(capability, Binder.getCallingUid(), Binder.getCallingPid());
+                mEnforcer.enforce(capability, Binder.getCallingUid(), Binder.getCallingPid());
             } catch (SecurityException se) {
-                safeAppVectorError(appCallback, OIRError.PERMISSION_DENIED, se.getMessage());
+                CallbackBridges.safeAppVectorError(appCallback, OIRError.PERMISSION_DENIED, se.getMessage());
                 return 0L;
             }
             if (!mRateLimiter.tryAcquire(Binder.getCallingUid())) {
-                safeAppVectorError(appCallback, OIRError.CAPABILITY_THROTTLED,
+                CallbackBridges.safeAppVectorError(appCallback, OIRError.CAPABILITY_THROTTLED,
                         "rate limit exceeded for capability " + capability);
                 return 0L;
             }
             if (query == null || query.isEmpty()) {
-                safeAppVectorError(appCallback, OIRError.INVALID_INPUT, "query is empty");
+                CallbackBridges.safeAppVectorError(appCallback, OIRError.INVALID_INPUT, "query is empty");
                 return 0L;
             }
             if (candidates == null || candidates.length == 0) {
-                safeAppVectorError(appCallback, OIRError.INVALID_INPUT, "candidates is empty");
+                CallbackBridges.safeAppVectorError(appCallback, OIRError.INVALID_INPUT, "candidates is empty");
                 return 0L;
             }
-            final long modelHandle = ensureOnnxModelFor(capability, /*isDetection=*/false);
+            final long modelHandle = mEnsurer.ensure(capability, ModelEnsurer.NO_REPORTER);
             if (modelHandle == 0L) {
-                safeAppVectorError(appCallback, OIRError.CAPABILITY_UNAVAILABLE_NO_MODEL,
+                CallbackBridges.safeAppVectorError(appCallback, OIRError.CAPABILITY_UNAVAILABLE_NO_MODEL,
                         "no reranker model for " + capability + " (OEM may bake-in)");
                 return 0L;
             }
             final IOirWorker worker;
             synchronized (mLifecycle.getLock()) { worker = mLifecycle.getWorkerLocked(); }
             if (worker == null) {
-                safeAppVectorError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
+                CallbackBridges.safeAppVectorError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
                 return 0L;
             }
             final long appHandle = mNextRequestHandle.getAndIncrement();
@@ -1236,11 +703,11 @@ public class OIRService extends SystemService {
                 long workerHandle = worker.submitRerank(modelHandle, query, candidates,
                         new WorkerVectorCallbackBridge(appHandle, appCallback));
                 mAppHandleToWorkerHandle.put(appHandle, workerHandle);
-                wireCancellationSignal(cancel, appHandle);
+                CallbackBridges.wireCancellationSignal(cancel, appHandle, mBinder::cancel);
                 return appHandle;
             } catch (RemoteException e) {
                 Log.w(TAG, "submitRerank failed app=" + appHandle, e);
-                safeAppVectorError(appCallback, OIRError.WORKER_UNAVAILABLE, "submitRerank: " + e.getMessage());
+                CallbackBridges.safeAppVectorError(appCallback, OIRError.WORKER_UNAVAILABLE, "submitRerank: " + e.getMessage());
                 return 0L;
             }
         }
@@ -1295,79 +762,26 @@ public class OIRService extends SystemService {
             if (capability == null) capability = "text.complete";
             Capability c = mCapabilityRegistry.get(capability);
             if (c == null) throw new IllegalArgumentException("unknown capability: " + capability);
+            mEnforcer.enforce(capability, Binder.getCallingUid(), Binder.getCallingPid());
+
+            // ModelEnsurer dispatches on capability backend + name and
+            // calls the right worker.loadX() — no more per-capability
+            // if/else chain that drifts apart from the submit path. Pre-
+            // ModelEnsurer: warm() had to mirror the 7-way dispatch, and
+            // the v0.6.1 audit caught warm hardcoding worker.load() for
+            // non-llama capabilities; that risk class is gone now.
+            long h = mEnsurer.ensure(capability, ModelEnsurer.NO_REPORTER);
+            if (h <= 0) return;
+
+            // Re-snapshot worker — death may have happened between
+            // ensure() returning and now. h>0 is no guarantee the worker
+            // is still attached at this instant.
+            IOirWorker w = mLifecycle.getWorker();
+            if (w == null) return;
             try {
-                enforceOirPermission(capability, Binder.getCallingUid(), Binder.getCallingPid());
-            } catch (SecurityException se) {
-                throw se;
-            }
-            // v0.6.1 audit: warm was hardcoded to worker.load(), which is the
-            // llama path only. Non-llama capabilities load via separate
-            // worker entry points (loadEmbed / loadWhisper / loadOnnx /
-            // loadVad / loadVlm / loadVisionEmbed) and were silently
-            // warming the wrong handle (or wrong model type, causing a
-            // spurious first-submit load). Dispatch on capability name +
-            // declared backend so warm() matches the ensure*ModelFor()
-            // chosen by the submit path.
-            // v0.6.9: do NOT hold mWorkerLock across the ensure*ModelFor
-            // calls — those methods themselves release mWorkerLock to issue
-            // the binder RPC, but Java's synchronized is reentrant for the
-            // same thread, so an outer synchronized(mWorkerLock) here would
-            // keep the lock held on this thread through the entire load,
-            // serializing every other app's submit behind one warm.
-            // Snapshot mWorker for the final warm() call; ensure* methods
-            // each handle their own mWorker==null check and short-circuit.
-            IOirWorker workerSnapshot;
-            synchronized (mLifecycle.getLock()) {
-                workerSnapshot = mLifecycle.getWorkerLocked();
-                if (workerSnapshot == null) return;
-            }
-            try {
-                long h;
-                String backend;
-                if (capability.startsWith("vision.describe")) {
-                    // VLM pair — ensureVlmModelFor parses the pipe-delimited
-                    // "mmproj|llm" default-model and calls loadVlm.
-                    h = ensureVlmModelFor(capability, /*cb=*/ null);
-                    backend = "vlm";
-                } else if (capability.startsWith("audio.transcribe")) {
-                    h = ensureWhisperModelFor(capability, /*cb=*/ null);
-                    backend = "whisper";
-                } else if (capability.startsWith("audio.vad")) {
-                    h = ensureVadModelFor(capability);
-                    backend = "vad";
-                } else if (capability.startsWith("vision.embed")) {
-                    h = ensureVisionEmbedModelFor(capability, /*cb=*/ null);
-                    backend = "vision_embed";
-                } else if (capability.startsWith("text.embed")) {
-                    h = ensureEmbedModelFor(capability, /*cb=*/ null);
-                    backend = "embed";
-                } else if (capability.startsWith("vision.detect")
-                        || capability.startsWith("vision.ocr")) {
-                    // ORT "detection" session-build flag — larger tensors.
-                    h = ensureOnnxModelFor(capability, /*isDetection=*/ true);
-                    backend = "ort_det";
-                } else if (capability.startsWith("text.classify")
-                        || capability.startsWith("text.rerank")
-                        || capability.startsWith("audio.synthesize")) {
-                    h = ensureOnnxModelFor(capability, /*isDetection=*/ false);
-                    backend = "ort";
-                } else {
-                    // Default: text.complete / text.translate / any llama-backed
-                    // capability we haven't special-cased. Goes through
-                    // ensureModelFor so per-capability pool + tuning knobs
-                    // match the submit() path.
-                    h = ensureModelFor(capability, /*cb=*/ null);
-                    backend = "llama";
-                }
-                if (h > 0) {
-                    // Re-snapshot mWorker in case binderDied since the first
-                    // read; ensure*ModelFor returning h>0 is no guarantee
-                    // that mWorker is still attached at this instant.
-                    IOirWorker w;
-                    synchronized (mLifecycle.getLock()) { w = mLifecycle.getWorkerLocked(); }
-                    if (w != null) w.warm(h);
-                }
-                Log.i(TAG, "warm capability=" + capability + " backend=" + backend + " handle=" + h);
+                w.warm(h);
+                Log.i(TAG, "warm capability=" + capability
+                        + " backend=" + c.backend + " handle=" + h);
             } catch (RemoteException e) {
                 Log.w(TAG, "warm failed for " + capability, e);
             }
@@ -1548,27 +962,7 @@ public class OIRService extends SystemService {
 
         @Override public void onError(int workerErrorCode, String message) {
             mAppHandleToWorkerHandle.remove(mAppHandle);
-            safeAppError(mAppCallback, workerErrorCode, message);
-        }
-    }
-
-    /**
-     * Permission enforcement used by {@link IOIRService.Stub#submit} and the shell path.
-     * effectiveUid lets the shell command simulate a non-system caller via --as-uid
-     * (userdebug/eng builds only; \see #submitAs).
-     */
-    void enforceOirPermission(String capability, int effectiveUid, int callingPid) {
-        String perm = mCapabilityRegistry.getRequiredPermission(capability);
-        if (perm == null) {
-            throw new IllegalArgumentException("unknown capability: " + capability);
-        }
-        // Shell UID bypass for developer ergonomics (unless --as-uid was set).
-        if (effectiveUid == Process.SHELL_UID) return;
-        int result = mContext.checkPermission(perm, callingPid, effectiveUid);
-        if (result != PackageManager.PERMISSION_GRANTED) {
-            throw new SecurityException("Permission Denial: " + perm
-                    + " required for capability " + capability
-                    + " (uid=" + effectiveUid + ")");
+            CallbackBridges.safeAppError(mAppCallback, workerErrorCode, message);
         }
     }
 
@@ -1586,21 +980,21 @@ public class OIRService extends SystemService {
         int effectiveUid = (asUid > 0) ? asUid : Process.SHELL_UID;
         // Route through the mBinder submit with permission check as the effective UID.
         if (mCapabilityRegistry.get(capability == null ? "text.complete" : capability) == null) {
-            safeAppError(cb, OIRError.INVALID_INPUT, "unknown capability: " + capability);
+            CallbackBridges.safeAppError(cb, OIRError.INVALID_INPUT, "unknown capability: " + capability);
             return 0L;
         }
         try {
-            enforceOirPermission(capability == null ? "text.complete" : capability,
+            mEnforcer.enforce(capability == null ? "text.complete" : capability,
                     effectiveUid, Binder.getCallingPid());
         } catch (SecurityException se) {
-            safeAppError(cb, OIRError.PERMISSION_DENIED, se.getMessage());
+            CallbackBridges.safeAppError(cb, OIRError.PERMISSION_DENIED, se.getMessage());
             return 0L;
         }
         // v0.5 V6: rate-limit against the simulated UID so `cmd oir --as-uid <N>`
         // exercises the same throttling path an app would hit. mBinder.submit()
         // below sees the real (shell) UID and bypasses.
         if (!mRateLimiter.tryAcquire(effectiveUid)) {
-            safeAppError(cb, OIRError.CAPABILITY_THROTTLED,
+            CallbackBridges.safeAppError(cb, OIRError.CAPABILITY_THROTTLED,
                     "rate limit exceeded for capability " + capability + " (as-uid=" + effectiveUid + ")");
             return 0L;
         }
@@ -1616,25 +1010,6 @@ public class OIRService extends SystemService {
             IOirWorker w = mLifecycle.getWorkerLocked();
             if (w == null) return null;
             return w.getMemoryStats();
-        }
-    }
-
-    /**
-     * v0.6.3: package-private helper for the runtime-pool columns in
-     * `cmd oir memory`. TSV-per-loaded-model from the worker. Empty or
-     * null when worker isn't attached — the caller prints model-level
-     * stats anyway.
-     */
-    String getInternalRuntimeStats() {
-        synchronized (mLifecycle.getLock()) {
-            IOirWorker w = mLifecycle.getWorkerLocked();
-            if (w == null) return null;
-            try {
-                return w.dumpRuntimeStats();
-            } catch (RemoteException e) {
-                Log.w(TAG, "dumpRuntimeStats failed", e);
-                return null;
-            }
         }
     }
 
@@ -1668,53 +1043,5 @@ public class OIRService extends SystemService {
         return fallback;
     }
 
-    /**
-     * v0.6.1 audit: cancellation had been wired only in submit() (text.complete
-     * path). Every other submit* method accepted the ICancellationSignal arg
-     * and dropped it — so apps could cancel text.complete but not text.embed,
-     * text.rerank, audio.synthesize, vision.detect, vision.ocr, or audio.vad.
-     * Single helper keeps the five submit* methods consistent and means a
-     * future change (different cancel semantics, backpressure, etc.) lands
-     * in one place.
-     */
-    private void wireCancellationSignal(ICancellationSignal cancel, long appHandle) {
-        if (cancel == null) return;
-        try {
-            CancellationSignal.fromTransport(cancel)
-                    .setOnCancelListener(() -> {
-                        try { mBinder.cancel(appHandle); }
-                        catch (RemoteException re) {
-                            Log.w(TAG, "cancel forward failed app=" + appHandle, re);
-                        }
-                    });
-        } catch (Exception e) {
-            Log.w(TAG, "setOnCancelListener failed app=" + appHandle, e);
-        }
-    }
-
-    private static void safeAppAudioError(IOIRAudioStreamCallback cb, int code, String msg) {
-        if (cb == null) return;
-        try { cb.onError(code, msg); } catch (RemoteException ignored) {}
-    }
-
-    private static void safeAppBboxError(IOIRBoundingBoxCallback cb, int code, String msg) {
-        if (cb == null) return;
-        try { cb.onError(code, msg); } catch (RemoteException ignored) {}
-    }
-
-    private static void safeAppVectorError(IOIRVectorCallback cb, int code, String msg) {
-        if (cb == null) return;
-        try { cb.onError(code, msg); } catch (RemoteException ignored) {}
-    }
-
-    private static void safeAppError(IOIRTokenCallback cb, int code, String msg) {
-        if (cb == null) return;
-        try { cb.onError(code, msg); } catch (RemoteException ignored) {}
-    }
-
-    private static void safeAppBooleanError(IOIRRealtimeBooleanCallback cb, int code, String msg) {
-        if (cb == null) return;
-        try { cb.onError(code, msg); } catch (RemoteException ignored) {}
-    }
 
 }

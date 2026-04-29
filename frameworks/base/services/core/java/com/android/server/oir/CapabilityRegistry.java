@@ -64,6 +64,37 @@ public final class CapabilityRegistry {
     public Collection<Capability> all()        { return Collections.unmodifiableCollection(mCapabilities.values()); }
 
     /**
+     * Variant-aware lookup. Tries the exact name first; if not found and
+     * the name carries a {@code :variant} suffix (e.g. {@code text.complete:fast}),
+     * strips the suffix and retries against the base capability.
+     *
+     * Today (pre-v0.7-variants) there are no {@code :variant} entries in
+     * capabilities.xml, so this method behaves identically to {@link #get}
+     * for every name a caller hands it. The fallback path is dormant
+     * infrastructure for the v0.7 variant work (CAPABILITIES.md §
+     * "Variants"): apps that ask for a tier the OEM didn't declare
+     * receive the base capability instead of {@code null}.
+     *
+     * Logged on cache miss so OEM operators see when an app is asking
+     * for a variant they didn't bake. Returns null only when neither the
+     * variant nor its base exists.
+     */
+    public Capability getOrFallback(String name) {
+        if (name == null) return null;
+        Capability c = mCapabilities.get(name);
+        if (c != null) return c;
+        int colon = name.indexOf(':');
+        if (colon <= 0) return null;
+        String base = name.substring(0, colon);
+        Capability fallback = mCapabilities.get(base);
+        if (fallback != null) {
+            Log.i(TAG, "capability variant '" + name + "' not declared; falling back to base '"
+                    + base + "'");
+        }
+        return fallback;
+    }
+
+    /**
      * v0.6.9: merge default-model overrides from {@link OirConfig}. The
      * platform {@code capabilities.xml} declares some capabilities
      * (notably {@code vision.describe}) with NO default-model because
