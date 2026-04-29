@@ -1,8 +1,8 @@
-# oir-framework-addons — OIR platform service
+# Open Intelligence Runtime Service (`oir-framework-addons`)
 
-Everything OIR-specific that lands under `frameworks/base/` in a JibarOS tree. The platform-service half of the Open Intelligence Runtime: `OIRService` registers in `system_server`, hosts the public AIDL surface (`IOIRService` and the 5 callback shapes), enforces per-namespace permissions, applies per-UID rate limits, dispatches every capability call to [oird](https://github.com/Jibar-OS/oird), and keeps a thin client-side cache of worker handles for cancel routing.
+The platform-side component of the Open Intelligence Runtime. `OIRService` registers in `system_server` as the binder service `oir`, hosts the public AIDL surface (`IOIRService` and the 5 callback shapes), enforces per-namespace permissions, applies per-UID rate limits, dispatches every capability call to [oird](https://github.com/Jibar-OS/oird) (the [Open Intelligence Runtime Daemon](https://github.com/Jibar-OS/oird)), and keeps a thin client-side cache of worker handles for cancel routing.
 
-New files only — no modifications to upstream AOSP files live here. Those go in [`oir-patches`](https://github.com/Jibar-OS/oir-patches), and there are five of them, ~69 lines.
+This repo ships everything OIR-specific that lands under `frameworks/base/` in a JibarOS tree — new files only, no modifications to upstream AOSP. Those upstream tweaks live in [`oir-patches`](https://github.com/Jibar-OS/oir-patches) (five small edits, ~69 lines).
 
 ## What's in here
 
