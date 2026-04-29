@@ -393,8 +393,10 @@ public class OIRService extends SystemService {
         // exercises the same throttling path an app would hit. mBinder.submit()
         // below sees the real (shell) UID and bypasses.
         if (!mRateLimiter.tryAcquire(effectiveUid)) {
+            long waitMs = mRateLimiter.nextTokenWaitMs(effectiveUid);
             CallbackBridges.safeAppError(cb, OIRError.CAPABILITY_THROTTLED,
-                    "rate limit exceeded for capability " + capability + " (as-uid=" + effectiveUid + ")");
+                    "rate limit exceeded for capability " + capability
+                            + " (as-uid=" + effectiveUid + ") — retry after " + waitMs + "ms");
             return 0L;
         }
         // Delegate to the regular (permission-skipped on this thread) submit path.

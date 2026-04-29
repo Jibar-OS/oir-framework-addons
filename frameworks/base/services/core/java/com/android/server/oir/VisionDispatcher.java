@@ -160,9 +160,12 @@ final class VisionDispatcher {
             reporter.report(OIRError.PERMISSION_DENIED, se.getMessage());
             return 0L;
         }
-        if (!mDeps.rateLimiter.tryAcquire(Binder.getCallingUid())) {
+        final int uid = Binder.getCallingUid();
+        if (!mDeps.rateLimiter.tryAcquire(uid)) {
+            long waitMs = mDeps.rateLimiter.nextTokenWaitMs(uid);
             reporter.report(OIRError.CAPABILITY_THROTTLED,
-                    "rate limit exceeded for capability " + capability);
+                    "rate limit exceeded for capability " + capability
+                            + " — retry after " + waitMs + "ms");
             return 0L;
         }
         return mDeps.ensurer.ensure(capability, reporter);

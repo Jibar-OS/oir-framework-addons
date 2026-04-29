@@ -101,15 +101,20 @@ final class ModelEnsurer {
             reporter.report(OIRError.INVALID_INPUT, "unknown capability: " + capability);
             return 0L;
         }
-        Long existing = mHandles.get(capability);
+        // Cache key MUST be the RESOLVED capability name, not the requested
+        // one. Otherwise text.complete:fast (which falls back to base
+        // text.complete) gets a separate cache entry from base text.complete
+        // — same physical model loaded twice. Use c.name so every variant
+        // that resolves to the same base shares the base's handle.
+        final String cacheKey = c.name;
+        Long existing = mHandles.get(cacheKey);
         if (existing != null) return existing;
 
         LoadKind kind = kindOf(c);
-        // Key includes a kind prefix so a (theoretically misrouted) caller
-        // using a different load shape for the same capability name doesn't
-        // collide with ours. Kept for forward-compat even though Phase 2
-        // routes every load through this single method.
-        String loadKey = kind.name() + ":" + capability;
+        // Same reasoning as cacheKey: dedup by resolved-capability identity,
+        // not requested-name identity, so concurrent variant + base callers
+        // wait on the same LoadFuture instead of racing parallel loads.
+        String loadKey = kind.name() + ":" + cacheKey;
 
         IOirWorker worker;
         String pathPrimary;       // path or clip-path for VLM
@@ -117,7 +122,7 @@ final class ModelEnsurer {
         LoadFuture ours = null;
         LoadFuture waitOn;
         synchronized (mLifecycle.getLock()) {
-            existing = mHandles.get(capability);
+            existing = mHandles.get(cacheKey);
             if (existing != null) return existing;
             if (mLifecycle.getWorkerLocked() == null) {
                 reporter.report(OIRError.WORKER_UNAVAILABLE, "worker not attached");
@@ -185,7 +190,7 @@ final class ModelEnsurer {
         }
 
         synchronized (mLifecycle.getLock()) {
-            if (h > 0) mHandles.put(capability, h);
+            if (h > 0) mHandles.put(cacheKey, h);
             mLoadDedup.remove(loadKey);
         }
         ours.complete(h, err);

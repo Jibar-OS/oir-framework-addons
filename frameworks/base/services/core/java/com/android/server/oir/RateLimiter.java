@@ -66,4 +66,39 @@ final class RateLimiter {
             return false;
         }
     }
+
+    /**
+     * Estimated milliseconds until this UID will have at least one token
+     * available — i.e. the wait the caller should respect before retrying
+     * after a {@link #tryAcquire} returned false.
+     *
+     * Returns 0 when a token is already available (system-level UIDs,
+     * throttling disabled, or this UID's bucket already at &gt;=1 token —
+     * common when the caller hits this method without first failing
+     * tryAcquire). Read-only inspection; does NOT consume a token.
+     *
+     * Surfaced through the throttle error message so the SDK's
+     * {@code OirThrottledException.retryAfterMs} carries the real wait
+     * (the SDK parses it from the message via regex). Pre-this method,
+     * the SDK silently fell back to 1000ms because the runtime never
+     * included a real number.
+     */
+    long nextTokenWaitMs(int uid) {
+        if (uid == 0 || uid == Process.SHELL_UID || uid == Process.SYSTEM_UID) {
+            return 0L;
+        }
+        synchronized (mLock) {
+            if (mRatePerMinute <= 0) return 0L;
+            Bucket b = mBuckets.get(uid);
+            if (b == null) return 0L; // fresh bucket starts at full burst
+            final long now = SystemClock.uptimeMillis();
+            final long elapsed = Math.max(0L, now - b.lastRefillMs);
+            final double tokensNow = Math.min((double) mBurst,
+                    b.tokens + elapsed * (mRatePerMinute / 60000.0));
+            if (tokensNow >= 1.0) return 0L;
+            final double tokensNeeded = 1.0 - tokensNow;
+            final double msPerToken = 60000.0 / mRatePerMinute;
+            return (long) Math.ceil(tokensNeeded * msPerToken);
+        }
+    }
 }
