@@ -22,14 +22,10 @@ import android.os.Build;
 import android.os.Process;
 import android.content.pm.PackageManager;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.HandlerThread;
 import android.os.CancellationSignal;
-import android.os.IBinder;
 import android.os.ICancellationSignal;
 import android.os.RemoteException;
 import android.os.ResultReceiver;
-import android.os.ServiceManager;
 import android.os.ShellCallback;
 import android.util.Log;
 
@@ -37,23 +33,12 @@ import com.android.server.SystemService;
 
 import java.io.FileDescriptor;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class OIRService extends SystemService {
 
     private static final String TAG = "OIRService";
     public static final String SERVICE_NAME = "oir";
-    private static final String WORKER_SERVICE_NAME = "oir_worker";
-
-    // v0.6 Phase A: retry forever. v0.5 capped at 60×2s=120s and gave up — if
-    // oird was slow to register (overlayfs remount, library load hiccup, long
-    // respawn grace) apps got "worker not attached" until reboot. Never give
-    // up: fast retries for the first minute (normal-boot window), then slow
-    // retries indefinitely with log rate-limit so we don't spam logcat.
-    private static final long ATTACH_RETRY_DELAY_FAST_MS = 2000L;
-    private static final long ATTACH_RETRY_DELAY_SLOW_MS = 10000L;
-    private static final int  ATTACH_FAST_ATTEMPTS       = 30;
 
     // v0.1 hardcoded; capability registry + OEM config lands in v0.2.
     private static final String DEFAULT_MODEL_PATH = "/product/etc/oir/qwen2.5-0.5b-instruct-q4_k_m.gguf";
@@ -62,73 +47,14 @@ public class OIRService extends SystemService {
     private final AtomicLong mNextRequestHandle = new AtomicLong(1);
     private final ConcurrentHashMap<Long, Long> mAppHandleToWorkerHandle = new ConcurrentHashMap<>();
 
-    private HandlerThread mProxyThread;
-    private Handler mProxyHandler;
+    // Per-capability worker handle cache. See HandleRegistry — one flat
+    // map keyed by capability name (globally unique per CapabilityRegistry
+    // invariant). Kind of handle (text-gen / embed / whisper / ort / vlm /
+    // vad / vision-embed) is derived from capability metadata at use sites.
+    private final HandleRegistry mHandles = new HandleRegistry();
 
-    private final Object mWorkerLock = new Object();
-    private IOirWorker mWorker;
-    private int  mAttachAttempt;
-
-    // v0.4: per-capability lazy-loaded handles. Replaces v0.1-0.3 scalar mModelHandle.
-    private final java.util.concurrent.ConcurrentHashMap<String, Long> mHandlesByCapability =
-            new java.util.concurrent.ConcurrentHashMap<>();
-    // v0.4 H4-A: separate handle map for Vector-shape (embedding-mode) capabilities.
-    private final java.util.concurrent.ConcurrentHashMap<String, Long> mEmbedHandlesByCapability =
-            new java.util.concurrent.ConcurrentHashMap<>();
-    // v0.4 H1: whisper handles for audio.* capabilities.
-    private final java.util.concurrent.ConcurrentHashMap<String, Long> mWhisperHandlesByCapability =
-            new java.util.concurrent.ConcurrentHashMap<>();
-    // v0.4 H2/H3: ONNX Runtime handles. audio.synthesize and vision.detect
-    // each get their own map entry (distinct handles even for the same file
-    // path since session options differ).
-    private final java.util.concurrent.ConcurrentHashMap<String, Long> mOnnxHandlesByCapability =
-            new java.util.concurrent.ConcurrentHashMap<>();
-    // v0.4 H4-B: vision encoder (SigLIP/CLIP) handles, distinct from text embed (llama) + ORT audio/detect.
-    private final java.util.concurrent.ConcurrentHashMap<String, Long> mVisionEmbedHandlesByCapability =
-            new java.util.concurrent.ConcurrentHashMap<>();
-    // v0.4 H6: VLM handles (vision.describe). Capability's default-model is
-    // pipe-delimited "clip.gguf|llm.gguf" — OIRService splits and passes to
-    // worker.loadVlm.
-    private final java.util.concurrent.ConcurrentHashMap<String, Long> mVlmHandlesByCapability =
-            new java.util.concurrent.ConcurrentHashMap<>();
-    // v0.5 V5: audio.vad handles (Silero ONNX via loadVad).
-    private final java.util.concurrent.ConcurrentHashMap<String, Long> mVadHandlesByCapability =
-            new java.util.concurrent.ConcurrentHashMap<>();
-
-    // v0.6.9: in-progress-load map. When a capability hits its first submit,
-    // the first caller claims the slot, drops mWorkerLock, issues the slow
-    // binder RPC (mWorker.load*()) unlocked, then re-acquires mWorkerLock to
-    // insert into the per-kind handle map + notify waiters. Concurrent
-    // callers for the same capability wait on the LoadFuture instead of
-    // racing a duplicate oird-side load (which would be deduplicated there
-    // too via the same path, but the Java-side wait avoids a burst of
-    // binder RPCs that all block until the first one wakes).
-    //
-    // Key = capability name. Capability names are globally unique across
-    // kinds (text.complete / audio.synthesize / vision.detect etc. — see
-    // capabilities.xml), so a single map covers every ensure*ModelFor.
-    private final ConcurrentHashMap<String, LoadFuture> mLoadingByCapability =
-            new ConcurrentHashMap<>();
-
-    private static final class LoadFuture {
-        private final CountDownLatch latch = new CountDownLatch(1);
-        private volatile long handle = 0L;
-        private volatile String errMsg;
-        /**
-         * Blocks until the owning thread publishes a result, then returns
-         * the loaded handle (0 on failure; inspect errMsg() for why).
-         */
-        long awaitHandle() throws InterruptedException {
-            latch.await();
-            return handle;
-        }
-        void complete(long h, String err) {
-            this.handle = h;
-            this.errMsg = err;
-            latch.countDown();
-        }
-        String errMsg() { return errMsg; }
-    }
+    // Concurrent-load dedup. See LoadDedup for the locking contract.
+    private final LoadDedup mLoadDedup = new LoadDedup();
 
     private final CapabilityRegistry mCapabilityRegistry = new CapabilityRegistry();
     private final OirConfig mConfig = new OirConfig();
@@ -139,6 +65,52 @@ public class OIRService extends SystemService {
     // v0.5 V6: per-UID token-bucket rate limiter. Configured from mConfig at onStart.
     private final RateLimiter mRateLimiter = new RateLimiter();
 
+    // Worker binder lifecycle: attach/retry, mWorker holding, death recipient.
+    // Listener body runs OUTSIDE the lock; onDeath acquires it as needed.
+    private final WorkerLifecycle mLifecycle = new WorkerLifecycle(new WorkerLifecycle.Listener() {
+        @Override public void onAttached(IOirWorker worker) {
+            try {
+                worker.setConfig(mConfig.getMemoryBudgetMb(), mConfig.getWarmTtlSeconds());
+            } catch (RemoteException e) {
+                Log.w(TAG, "setConfig failed", e);
+            }
+            // v0.5 V7: push per-capability tuning knobs. Unknown keys are
+            // ignored by oird, so forward-compat with later additions costs
+            // nothing.
+            for (java.util.Map.Entry<String, Float> e : mConfig.getCapabilityTuning().entrySet()) {
+                try {
+                    worker.setCapabilityFloat(e.getKey(), e.getValue());
+                } catch (RemoteException re) {
+                    Log.w(TAG, "setCapabilityFloat " + e.getKey() + " failed", re);
+                }
+            }
+            // v0.5 V7 full: string-valued knobs (whisper_language, family, etc.).
+            for (java.util.Map.Entry<String, String> e : mConfig.getCapabilityTuningStrings().entrySet()) {
+                try {
+                    worker.setCapabilityString(e.getKey(), e.getValue());
+                } catch (RemoteException re) {
+                    Log.w(TAG, "setCapabilityString " + e.getKey() + " failed", re);
+                }
+            }
+        }
+
+        @Override public void onDeath() {
+            // All cached handles point at freed contexts in the dead oird;
+            // clear so the next submit per capability re-loads against the
+            // new worker. Drain in-flight LoadFutures inside the same
+            // critical section, then complete them outside the lock so
+            // waiting threads wake without holding it.
+            java.util.List<LoadFuture> orphaned;
+            synchronized (mLifecycle.getLock()) {
+                mHandles.clearAll();
+                orphaned = mLoadDedup.drainAndClear();
+            }
+            for (LoadFuture f : orphaned) {
+                f.complete(0L, "worker died mid-load");
+            }
+        }
+    });
+
     public OIRService(Context context) {
         super(context);
         mContext = context;
@@ -147,10 +119,6 @@ public class OIRService extends SystemService {
     @Override
     public void onStart() {
         Log.i(TAG, "onStart: initializing OIR service");
-        mProxyThread = new HandlerThread("oir-proxy",
-                android.os.Process.THREAD_PRIORITY_BACKGROUND);
-        mProxyThread.start();
-        mProxyHandler = new Handler(mProxyThread.getLooper());
 
         mCapabilityRegistry.load();
         mConfig.load();
@@ -165,12 +133,11 @@ public class OIRService extends SystemService {
         // Bug fix v0.2: SystemServer registers OIRService near the end of
         // startOtherServices() -- AFTER PHASE_SYSTEM_SERVICES_READY has
         // already ticked. onBootPhase(500) therefore never fires on us, so
-        // we trigger the worker attach directly from onStart. oird is
-        // usually already registered by this point (init started it
-        // seconds earlier); the retry loop handles the rare race where
-        // it is not.
-        mProxyHandler.post(this::attachWorker);
-        Log.i(TAG, "onStart: published and attachWorker posted");
+        // we kick the worker attach directly from onStart. oird is usually
+        // already registered by this point (init started it seconds earlier);
+        // the retry loop in WorkerLifecycle handles the rare race where it isn't.
+        mLifecycle.start();
+        Log.i(TAG, "onStart: published and lifecycle started");
     }
 
     @Override
@@ -179,97 +146,6 @@ public class OIRService extends SystemService {
         // retained for potential future hooks (e.g., warm-up on
         // PHASE_THIRD_PARTY_APPS_CAN_START).
     }
-
-    private void attachWorker() {
-        IBinder binder = ServiceManager.getService(WORKER_SERVICE_NAME);
-        if (binder == null) {
-            mAttachAttempt++;
-            final long delay = mAttachAttempt <= ATTACH_FAST_ATTEMPTS
-                    ? ATTACH_RETRY_DELAY_FAST_MS
-                    : ATTACH_RETRY_DELAY_SLOW_MS;
-            // Log every fast attempt; on the slow track, log every 6th
-            // (~once/min) to keep the signal without logcat spam.
-            if (mAttachAttempt <= ATTACH_FAST_ATTEMPTS || mAttachAttempt % 6 == 0) {
-                Log.w(TAG, "worker \"" + WORKER_SERVICE_NAME + "\" not registered yet; "
-                        + "attempt " + mAttachAttempt + " retry in " + delay + "ms");
-            }
-            mProxyHandler.postDelayed(this::attachWorker, delay);
-            return;
-        }
-        mAttachAttempt = 0;
-
-        try {
-            binder.linkToDeath(mWorkerDeath, 0);
-        } catch (RemoteException e) {
-            Log.w(TAG, "linkToDeath failed", e);
-        }
-
-        IOirWorker worker = IOirWorker.Stub.asInterface(binder);
-        synchronized (mWorkerLock) { mWorker = worker; }
-        try {
-            worker.setConfig(mConfig.getMemoryBudgetMb(), mConfig.getWarmTtlSeconds());
-        } catch (RemoteException e) {
-            Log.w(TAG, "setConfig failed", e);
-        }
-        // v0.5 V7: push per-capability tuning knobs. Unknown keys are ignored
-        // by oird, so forward-compat with v0.6 additions costs nothing.
-        for (java.util.Map.Entry<String, Float> e : mConfig.getCapabilityTuning().entrySet()) {
-            try {
-                worker.setCapabilityFloat(e.getKey(), e.getValue());
-            } catch (RemoteException re) {
-                Log.w(TAG, "setCapabilityFloat " + e.getKey() + " failed", re);
-            }
-        }
-        // v0.5 V7 full: string-valued knobs (whisper_language, family, etc.).
-        for (java.util.Map.Entry<String, String> e : mConfig.getCapabilityTuningStrings().entrySet()) {
-            try {
-                worker.setCapabilityString(e.getKey(), e.getValue());
-            } catch (RemoteException re) {
-                Log.w(TAG, "setCapabilityString " + e.getKey() + " failed", re);
-            }
-        }
-        Log.i(TAG, "attached to oird worker");
-
-        Log.i(TAG, "attached to oird worker; models will load lazily per capability on first submit");
-    }
-
-    private final IBinder.DeathRecipient mWorkerDeath = new IBinder.DeathRecipient() {
-        @Override public void binderDied() {
-            Log.w(TAG, "oird died; clearing handles. init will respawn it.");
-            java.util.List<LoadFuture> orphaned;
-            synchronized (mWorkerLock) {
-                mWorker = null;
-                mHandlesByCapability.clear();  // v0.4: all handles invalid after respawn
-                mEmbedHandlesByCapability.clear();
-                mWhisperHandlesByCapability.clear();
-                mOnnxHandlesByCapability.clear();
-                mVlmHandlesByCapability.clear();
-                mVisionEmbedHandlesByCapability.clear();
-                // v0.6.1 audit: this was missing. VAD handles are per-oird-PID
-                // just like every other handle map — stale entries after respawn
-                // meant submitVad would hand the new oird a worker handle that
-                // pointed at the dead worker's context.
-                mVadHandlesByCapability.clear();
-
-                // v0.6.9 audit: any in-flight load that claimed a LoadFuture
-                // but was still awaiting oird's response will never get a
-                // reply now — the RemoteException either already fired on
-                // the owner thread (which will publish + cleanup itself) or
-                // the owner was mid-setup and hadn't issued the RPC yet.
-                // In both cases, WAITERS on the future would block forever
-                // if we leave an orphaned LoadFuture in the map. Drain the
-                // map here and complete each future with failure so any
-                // waiter wakes and reports a clean WORKER_UNAVAILABLE.
-                orphaned = new java.util.ArrayList<>(mLoadingByCapability.values());
-                mLoadingByCapability.clear();
-            }
-            for (LoadFuture f : orphaned) {
-                f.complete(0L, "worker died mid-load");
-            }
-            mProxyHandler.postDelayed(OIRService.this::attachWorker, 1000L);
-        }
-    };
-
 
     /**
      * v0.4 lazy-load: look up or load the model for this capability.
@@ -282,7 +158,7 @@ public class OIRService extends SystemService {
             safeAppError(cb, OIRError.INVALID_INPUT, "unknown capability: " + capability);
             return 0L;
         }
-        Long existing = mHandlesByCapability.get(capability);
+        Long existing = mHandles.get(capability);
         if (existing != null) return existing;
 
         // v0.6.9: only hold mWorkerLock long enough to claim a LoadFuture or
@@ -296,14 +172,14 @@ public class OIRService extends SystemService {
         String path;
         LoadFuture ours = null;
         LoadFuture waitOn = null;
-        synchronized (mWorkerLock) {
-            existing = mHandlesByCapability.get(capability);
+        synchronized (mLifecycle.getLock()) {
+            existing = mHandles.get(capability);
             if (existing != null) return existing;
-            if (mWorker == null) {
+            if (mLifecycle.getWorkerLocked() == null) {
                 safeAppError(cb, OIRError.WORKER_UNAVAILABLE, "worker not attached");
                 return 0L;
             }
-            waitOn = mLoadingByCapability.get(loadKey);
+            waitOn = mLoadDedup.get(loadKey);
             if (waitOn == null) {
                 path = c.defaultModelPath;
                 if (path == null || path.isEmpty()) {
@@ -312,8 +188,8 @@ public class OIRService extends SystemService {
                     return 0L;
                 }
                 ours = new LoadFuture();
-                mLoadingByCapability.put(loadKey, ours);
-                worker = mWorker;
+                mLoadDedup.put(loadKey, ours);
+                worker = mLifecycle.getWorkerLocked();
             } else {
                 worker = null;
                 path = null;
@@ -346,9 +222,9 @@ public class OIRService extends SystemService {
             Log.w(TAG, "worker.load failed for " + capability, e);
         }
 
-        synchronized (mWorkerLock) {
-            if (h > 0) mHandlesByCapability.put(capability, h);
-            mLoadingByCapability.remove(loadKey);
+        synchronized (mLifecycle.getLock()) {
+            if (h > 0) mHandles.put(capability, h);
+            mLoadDedup.remove(loadKey);
         }
         ours.complete(h, err);
 
@@ -370,7 +246,7 @@ public class OIRService extends SystemService {
             safeAppVectorError(cb, OIRError.INVALID_INPUT, "unknown capability: " + capability);
             return 0L;
         }
-        Long existing = mEmbedHandlesByCapability.get(capability);
+        Long existing = mHandles.get(capability);
         if (existing != null) return existing;
 
         // v0.6.9: release mWorkerLock around binder RPC (see ensureModelFor).
@@ -379,14 +255,14 @@ public class OIRService extends SystemService {
         String path;
         LoadFuture ours = null;
         LoadFuture waitOn;
-        synchronized (mWorkerLock) {
-            existing = mEmbedHandlesByCapability.get(capability);
+        synchronized (mLifecycle.getLock()) {
+            existing = mHandles.get(capability);
             if (existing != null) return existing;
-            if (mWorker == null) {
+            if (mLifecycle.getWorkerLocked() == null) {
                 safeAppVectorError(cb, OIRError.WORKER_UNAVAILABLE, "worker not attached");
                 return 0L;
             }
-            waitOn = mLoadingByCapability.get(loadKey);
+            waitOn = mLoadDedup.get(loadKey);
             if (waitOn == null) {
                 path = c.defaultModelPath;
                 if (path == null || path.isEmpty()) {
@@ -395,8 +271,8 @@ public class OIRService extends SystemService {
                     return 0L;
                 }
                 ours = new LoadFuture();
-                mLoadingByCapability.put(loadKey, ours);
-                worker = mWorker;
+                mLoadDedup.put(loadKey, ours);
+                worker = mLifecycle.getWorkerLocked();
             } else {
                 worker = null;
                 path = null;
@@ -427,9 +303,9 @@ public class OIRService extends SystemService {
             Log.w(TAG, "worker.loadEmbed failed for " + capability, e);
         }
 
-        synchronized (mWorkerLock) {
-            if (h > 0) mEmbedHandlesByCapability.put(capability, h);
-            mLoadingByCapability.remove(loadKey);
+        synchronized (mLifecycle.getLock()) {
+            if (h > 0) mHandles.put(capability, h);
+            mLoadDedup.remove(loadKey);
         }
         ours.complete(h, err);
 
@@ -451,7 +327,7 @@ public class OIRService extends SystemService {
             safeAppError(cb, OIRError.INVALID_INPUT, "unknown capability: " + capability);
             return 0L;
         }
-        Long existing = mWhisperHandlesByCapability.get(capability);
+        Long existing = mHandles.get(capability);
         if (existing != null) return existing;
 
         final String loadKey = "loadWhisper:" + capability;
@@ -459,14 +335,14 @@ public class OIRService extends SystemService {
         String path;
         LoadFuture ours = null;
         LoadFuture waitOn;
-        synchronized (mWorkerLock) {
-            existing = mWhisperHandlesByCapability.get(capability);
+        synchronized (mLifecycle.getLock()) {
+            existing = mHandles.get(capability);
             if (existing != null) return existing;
-            if (mWorker == null) {
+            if (mLifecycle.getWorkerLocked() == null) {
                 safeAppError(cb, OIRError.WORKER_UNAVAILABLE, "worker not attached");
                 return 0L;
             }
-            waitOn = mLoadingByCapability.get(loadKey);
+            waitOn = mLoadDedup.get(loadKey);
             if (waitOn == null) {
                 path = c.defaultModelPath;
                 if (path == null || path.isEmpty()) {
@@ -475,8 +351,8 @@ public class OIRService extends SystemService {
                     return 0L;
                 }
                 ours = new LoadFuture();
-                mLoadingByCapability.put(loadKey, ours);
-                worker = mWorker;
+                mLoadDedup.put(loadKey, ours);
+                worker = mLifecycle.getWorkerLocked();
             } else {
                 worker = null;
                 path = null;
@@ -507,9 +383,9 @@ public class OIRService extends SystemService {
             Log.w(TAG, "worker.loadWhisper failed for " + capability, e);
         }
 
-        synchronized (mWorkerLock) {
-            if (h > 0) mWhisperHandlesByCapability.put(capability, h);
-            mLoadingByCapability.remove(loadKey);
+        synchronized (mLifecycle.getLock()) {
+            if (h > 0) mHandles.put(capability, h);
+            mLoadDedup.remove(loadKey);
         }
         ours.complete(h, err);
 
@@ -534,7 +410,7 @@ public class OIRService extends SystemService {
     private long ensureOnnxModelFor(String capability, boolean isDetection) {
         Capability c = mCapabilityRegistry.get(capability);
         if (c == null) return 0L;
-        Long existing = mOnnxHandlesByCapability.get(capability);
+        Long existing = mHandles.get(capability);
         if (existing != null) return existing;
 
         final String loadKey = (isDetection ? "loadOnnxDet:" : "loadOnnxSynth:") + capability;
@@ -542,17 +418,17 @@ public class OIRService extends SystemService {
         String path;
         LoadFuture ours = null;
         LoadFuture waitOn;
-        synchronized (mWorkerLock) {
-            existing = mOnnxHandlesByCapability.get(capability);
+        synchronized (mLifecycle.getLock()) {
+            existing = mHandles.get(capability);
             if (existing != null) return existing;
-            if (mWorker == null) return 0L;
-            waitOn = mLoadingByCapability.get(loadKey);
+            if (mLifecycle.getWorkerLocked() == null) return 0L;
+            waitOn = mLoadDedup.get(loadKey);
             if (waitOn == null) {
                 path = c.defaultModelPath;
                 if (path == null || path.isEmpty()) return 0L;
                 ours = new LoadFuture();
-                mLoadingByCapability.put(loadKey, ours);
-                worker = mWorker;
+                mLoadDedup.put(loadKey, ours);
+                worker = mLifecycle.getWorkerLocked();
             } else {
                 worker = null;
                 path = null;
@@ -578,9 +454,9 @@ public class OIRService extends SystemService {
             Log.w(TAG, "worker.loadOnnx failed for " + capability, e);
         }
 
-        synchronized (mWorkerLock) {
-            if (h > 0) mOnnxHandlesByCapability.put(capability, h);
-            mLoadingByCapability.remove(loadKey);
+        synchronized (mLifecycle.getLock()) {
+            if (h > 0) mHandles.put(capability, h);
+            mLoadDedup.remove(loadKey);
         }
         ours.complete(h, err);
 
@@ -595,7 +471,7 @@ public class OIRService extends SystemService {
     private long ensureVadModelFor(String capability) {
         Capability c = mCapabilityRegistry.get(capability);
         if (c == null) return 0L;
-        Long existing = mVadHandlesByCapability.get(capability);
+        Long existing = mHandles.get(capability);
         if (existing != null) return existing;
 
         final String loadKey = "loadVad:" + capability;
@@ -603,17 +479,17 @@ public class OIRService extends SystemService {
         String path;
         LoadFuture ours = null;
         LoadFuture waitOn;
-        synchronized (mWorkerLock) {
-            existing = mVadHandlesByCapability.get(capability);
+        synchronized (mLifecycle.getLock()) {
+            existing = mHandles.get(capability);
             if (existing != null) return existing;
-            if (mWorker == null) return 0L;
-            waitOn = mLoadingByCapability.get(loadKey);
+            if (mLifecycle.getWorkerLocked() == null) return 0L;
+            waitOn = mLoadDedup.get(loadKey);
             if (waitOn == null) {
                 path = c.defaultModelPath;
                 if (path == null || path.isEmpty()) return 0L;
                 ours = new LoadFuture();
-                mLoadingByCapability.put(loadKey, ours);
-                worker = mWorker;
+                mLoadDedup.put(loadKey, ours);
+                worker = mLifecycle.getWorkerLocked();
             } else {
                 worker = null;
                 path = null;
@@ -639,9 +515,9 @@ public class OIRService extends SystemService {
             Log.w(TAG, "worker.loadVad failed for " + capability, e);
         }
 
-        synchronized (mWorkerLock) {
-            if (h > 0) mVadHandlesByCapability.put(capability, h);
-            mLoadingByCapability.remove(loadKey);
+        synchronized (mLifecycle.getLock()) {
+            if (h > 0) mHandles.put(capability, h);
+            mLoadDedup.remove(loadKey);
         }
         ours.complete(h, err);
 
@@ -657,7 +533,7 @@ public class OIRService extends SystemService {
             safeAppError(cb, OIRError.INVALID_INPUT, "unknown capability: " + capability);
             return 0L;
         }
-        Long existing = mVlmHandlesByCapability.get(capability);
+        Long existing = mHandles.get(capability);
         if (existing != null) return existing;
 
         final String loadKey = "loadVlm:" + capability;
@@ -666,14 +542,14 @@ public class OIRService extends SystemService {
         String llmPath;
         LoadFuture ours = null;
         LoadFuture waitOn;
-        synchronized (mWorkerLock) {
-            existing = mVlmHandlesByCapability.get(capability);
+        synchronized (mLifecycle.getLock()) {
+            existing = mHandles.get(capability);
             if (existing != null) return existing;
-            if (mWorker == null) {
+            if (mLifecycle.getWorkerLocked() == null) {
                 safeAppError(cb, OIRError.WORKER_UNAVAILABLE, "worker not attached");
                 return 0L;
             }
-            waitOn = mLoadingByCapability.get(loadKey);
+            waitOn = mLoadDedup.get(loadKey);
             if (waitOn == null) {
                 String path = c.defaultModelPath;
                 if (path == null || path.isEmpty() || !path.contains("|")) {
@@ -686,8 +562,8 @@ public class OIRService extends SystemService {
                 clipPath = path.substring(0, bar);
                 llmPath = path.substring(bar + 1);
                 ours = new LoadFuture();
-                mLoadingByCapability.put(loadKey, ours);
-                worker = mWorker;
+                mLoadDedup.put(loadKey, ours);
+                worker = mLifecycle.getWorkerLocked();
             } else {
                 worker = null;
                 clipPath = null;
@@ -719,9 +595,9 @@ public class OIRService extends SystemService {
             Log.w(TAG, "worker.loadVlm failed for " + capability, e);
         }
 
-        synchronized (mWorkerLock) {
-            if (h > 0) mVlmHandlesByCapability.put(capability, h);
-            mLoadingByCapability.remove(loadKey);
+        synchronized (mLifecycle.getLock()) {
+            if (h > 0) mHandles.put(capability, h);
+            mLoadDedup.remove(loadKey);
         }
         ours.complete(h, err);
 
@@ -744,7 +620,7 @@ public class OIRService extends SystemService {
             safeAppVectorError(cb, OIRError.INVALID_INPUT, "unknown capability: " + capability);
             return 0L;
         }
-        Long existing = mVisionEmbedHandlesByCapability.get(capability);
+        Long existing = mHandles.get(capability);
         if (existing != null) return existing;
 
         final String loadKey = "loadVisionEmbed:" + capability;
@@ -752,14 +628,14 @@ public class OIRService extends SystemService {
         String path;
         LoadFuture ours = null;
         LoadFuture waitOn;
-        synchronized (mWorkerLock) {
-            existing = mVisionEmbedHandlesByCapability.get(capability);
+        synchronized (mLifecycle.getLock()) {
+            existing = mHandles.get(capability);
             if (existing != null) return existing;
-            if (mWorker == null) {
+            if (mLifecycle.getWorkerLocked() == null) {
                 safeAppVectorError(cb, OIRError.WORKER_UNAVAILABLE, "worker not attached");
                 return 0L;
             }
-            waitOn = mLoadingByCapability.get(loadKey);
+            waitOn = mLoadDedup.get(loadKey);
             if (waitOn == null) {
                 path = c.defaultModelPath;
                 if (path == null || path.isEmpty()) {
@@ -768,8 +644,8 @@ public class OIRService extends SystemService {
                     return 0L;
                 }
                 ours = new LoadFuture();
-                mLoadingByCapability.put(loadKey, ours);
-                worker = mWorker;
+                mLoadDedup.put(loadKey, ours);
+                worker = mLifecycle.getWorkerLocked();
             } else {
                 worker = null;
                 path = null;
@@ -800,9 +676,9 @@ public class OIRService extends SystemService {
             Log.w(TAG, "worker.loadVisionEmbed failed for " + capability, e);
         }
 
-        synchronized (mWorkerLock) {
-            if (h > 0) mVisionEmbedHandlesByCapability.put(capability, h);
-            mLoadingByCapability.remove(loadKey);
+        synchronized (mLifecycle.getLock()) {
+            if (h > 0) mHandles.put(capability, h);
+            mLoadDedup.remove(loadKey);
         }
         ours.complete(h, err);
 
@@ -859,7 +735,7 @@ public class OIRService extends SystemService {
                 final long vlmHandle = ensureVlmModelFor(capability, appCallback);
                 if (vlmHandle == 0L) return 0L;
                 final IOirWorker vw;
-                synchronized (mWorkerLock) { vw = mWorker; }
+                synchronized (mLifecycle.getLock()) { vw = mLifecycle.getWorkerLocked(); }
                 if (vw == null) {
                     safeAppError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
                     return 0L;
@@ -932,7 +808,7 @@ public class OIRService extends SystemService {
                 final long whisperHandle = ensureWhisperModelFor(capability, appCallback);
                 if (whisperHandle == 0L) return 0L;
                 final IOirWorker wworker;
-                synchronized (mWorkerLock) { wworker = mWorker; }
+                synchronized (mLifecycle.getLock()) { wworker = mLifecycle.getWorkerLocked(); }
                 if (wworker == null) {
                     safeAppError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
                     return 0L;
@@ -963,8 +839,8 @@ public class OIRService extends SystemService {
             final long modelHandle = ensureModelFor(capability, appCallback);
             if (modelHandle == 0L) return 0L;  // error already reported by ensureModelFor
             final IOirWorker worker;
-            synchronized (mWorkerLock) {
-                worker = mWorker;
+            synchronized (mLifecycle.getLock()) {
+                worker = mLifecycle.getWorkerLocked();
             }
 
             if (worker == null) {
@@ -1025,7 +901,7 @@ public class OIRService extends SystemService {
             Long workerHandle = mAppHandleToWorkerHandle.remove(requestHandle);
             if (workerHandle == null) return;
             IOirWorker worker;
-            synchronized (mWorkerLock) { worker = mWorker; }
+            synchronized (mLifecycle.getLock()) { worker = mLifecycle.getWorkerLocked(); }
             if (worker == null) return;
             try { worker.cancel(workerHandle); }
             catch (RemoteException e) { Log.w(TAG, "cancel failed app=" + requestHandle, e); }
@@ -1061,7 +937,7 @@ public class OIRService extends SystemService {
                 final long vHandle = ensureVisionEmbedModelFor(capability, appCallback);
                 if (vHandle == 0L) return 0L;
                 final IOirWorker vw;
-                synchronized (mWorkerLock) { vw = mWorker; }
+                synchronized (mLifecycle.getLock()) { vw = mLifecycle.getWorkerLocked(); }
                 if (vw == null) {
                     safeAppVectorError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
                     return 0L;
@@ -1096,7 +972,7 @@ public class OIRService extends SystemService {
                     return 0L;
                 }
                 final IOirWorker cw;
-                synchronized (mWorkerLock) { cw = mWorker; }
+                synchronized (mLifecycle.getLock()) { cw = mLifecycle.getWorkerLocked(); }
                 if (cw == null) {
                     safeAppVectorError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
                     return 0L;
@@ -1118,7 +994,7 @@ public class OIRService extends SystemService {
             final long modelHandle = ensureEmbedModelFor(capability, appCallback);
             if (modelHandle == 0L) return 0L;
             final IOirWorker worker;
-            synchronized (mWorkerLock) { worker = mWorker; }
+            synchronized (mLifecycle.getLock()) { worker = mLifecycle.getWorkerLocked(); }
             if (worker == null) {
                 safeAppVectorError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
                 return 0L;
@@ -1173,7 +1049,7 @@ public class OIRService extends SystemService {
                 return 0L;
             }
             final IOirWorker worker;
-            synchronized (mWorkerLock) { worker = mWorker; }
+            synchronized (mLifecycle.getLock()) { worker = mLifecycle.getWorkerLocked(); }
             if (worker == null) {
                 safeAppAudioError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
                 return 0L;
@@ -1235,7 +1111,7 @@ public class OIRService extends SystemService {
                 return 0L;
             }
             final IOirWorker worker;
-            synchronized (mWorkerLock) { worker = mWorker; }
+            synchronized (mLifecycle.getLock()) { worker = mLifecycle.getWorkerLocked(); }
             if (worker == null) {
                 safeAppBboxError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
                 return 0L;
@@ -1293,7 +1169,7 @@ public class OIRService extends SystemService {
                 return 0L;
             }
             final IOirWorker worker;
-            synchronized (mWorkerLock) { worker = mWorker; }
+            synchronized (mLifecycle.getLock()) { worker = mLifecycle.getWorkerLocked(); }
             if (worker == null) {
                 safeAppBooleanError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
                 return 0L;
@@ -1350,7 +1226,7 @@ public class OIRService extends SystemService {
                 return 0L;
             }
             final IOirWorker worker;
-            synchronized (mWorkerLock) { worker = mWorker; }
+            synchronized (mLifecycle.getLock()) { worker = mLifecycle.getWorkerLocked(); }
             if (worker == null) {
                 safeAppVectorError(appCallback, OIRError.WORKER_UNAVAILABLE, "worker not attached");
                 return 0L;
@@ -1404,7 +1280,7 @@ public class OIRService extends SystemService {
             // Fast path: no binder hop when the platform rule lets us stat directly.
             if (new java.io.File(path).isFile()) return true;
             final IOirWorker w;
-            synchronized (mWorkerLock) { w = mWorker; }
+            synchronized (mLifecycle.getLock()) { w = mLifecycle.getWorkerLocked(); }
             if (w == null) return false;
             try {
                 return w.fileIsReadable(path);
@@ -1441,8 +1317,8 @@ public class OIRService extends SystemService {
             // Snapshot mWorker for the final warm() call; ensure* methods
             // each handle their own mWorker==null check and short-circuit.
             IOirWorker workerSnapshot;
-            synchronized (mWorkerLock) {
-                workerSnapshot = mWorker;
+            synchronized (mLifecycle.getLock()) {
+                workerSnapshot = mLifecycle.getWorkerLocked();
                 if (workerSnapshot == null) return;
             }
             try {
@@ -1488,7 +1364,7 @@ public class OIRService extends SystemService {
                     // read; ensure*ModelFor returning h>0 is no guarantee
                     // that mWorker is still attached at this instant.
                     IOirWorker w;
-                    synchronized (mWorkerLock) { w = mWorker; }
+                    synchronized (mLifecycle.getLock()) { w = mLifecycle.getWorkerLocked(); }
                     if (w != null) w.warm(h);
                 }
                 Log.i(TAG, "warm capability=" + capability + " backend=" + backend + " handle=" + h);
@@ -1736,9 +1612,10 @@ public class OIRService extends SystemService {
 
     /** v0.4 S2: package-private helper for OIRShellCommand cmdDumpsysMemory. */
     com.android.server.oir.MemoryStats getInternalMemoryStats() throws RemoteException {
-        synchronized (mWorkerLock) {
-            if (mWorker == null) return null;
-            return mWorker.getMemoryStats();
+        synchronized (mLifecycle.getLock()) {
+            IOirWorker w = mLifecycle.getWorkerLocked();
+            if (w == null) return null;
+            return w.getMemoryStats();
         }
     }
 
@@ -1749,10 +1626,11 @@ public class OIRService extends SystemService {
      * stats anyway.
      */
     String getInternalRuntimeStats() {
-        synchronized (mWorkerLock) {
-            if (mWorker == null) return null;
+        synchronized (mLifecycle.getLock()) {
+            IOirWorker w = mLifecycle.getWorkerLocked();
+            if (w == null) return null;
             try {
-                return mWorker.dumpRuntimeStats();
+                return w.dumpRuntimeStats();
             } catch (RemoteException e) {
                 Log.w(TAG, "dumpRuntimeStats failed", e);
                 return null;
@@ -1837,65 +1715,6 @@ public class OIRService extends SystemService {
     private static void safeAppBooleanError(IOIRRealtimeBooleanCallback cb, int code, String msg) {
         if (cb == null) return;
         try { cb.onError(code, msg); } catch (RemoteException ignored) {}
-    }
-
-    /**
-     * v0.5 V6: per-UID token-bucket rate limiter.
-     *
-     * A call is allowed if the caller's bucket has ≥ 1 token. Tokens refill at
-     * (ratePerMinute / 60000) per millisecond up to the burst cap. SHELL_UID
-     * and SYSTEM_UID bypass the limiter entirely (so {@code cmd oir} and
-     * other system-level callers are never throttled).
-     *
-     * A ratePerMinute of 0 disables throttling globally. Configured from
-     * OirConfig via {@link #configure(int, int)} at onStart.
-     */
-    private static final class RateLimiter {
-        private static final class Bucket {
-            double tokens;
-            long lastRefillMs;
-        }
-
-        private final Object mLock = new Object();
-        private final java.util.HashMap<Integer, Bucket> mBuckets = new java.util.HashMap<>();
-        private int mRatePerMinute;
-        private int mBurst;
-
-        void configure(int ratePerMinute, int burst) {
-            synchronized (mLock) {
-                mRatePerMinute = ratePerMinute;
-                mBurst = burst;
-                mBuckets.clear();
-            }
-        }
-
-        /** Returns true if the call is allowed; false if throttled. */
-        boolean tryAcquire(int uid) {
-            // System-level callers bypass throttling. UID 0 = root.
-            if (uid == 0 || uid == Process.SHELL_UID || uid == Process.SYSTEM_UID) {
-                return true;
-            }
-            synchronized (mLock) {
-                if (mRatePerMinute <= 0) return true; // throttling disabled
-                final long now = android.os.SystemClock.uptimeMillis();
-                Bucket b = mBuckets.get(uid);
-                if (b == null) {
-                    b = new Bucket();
-                    b.tokens = mBurst;
-                    b.lastRefillMs = now;
-                    mBuckets.put(uid, b);
-                }
-                final long elapsed = Math.max(0L, now - b.lastRefillMs);
-                final double refill = elapsed * (mRatePerMinute / 60000.0);
-                b.tokens = Math.min((double) mBurst, b.tokens + refill);
-                b.lastRefillMs = now;
-                if (b.tokens >= 1.0) {
-                    b.tokens -= 1.0;
-                    return true;
-                }
-                return false;
-            }
-        }
     }
 
 }
