@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 The OpenIntelligenceRuntime Project
+ * Copyright (C) 2026 The Open Intelligence Runtime Project, a JibarOS project
  * Licensed under the Apache License, Version 2.0
  *
  * v0.4 H4-A: worker-side vector callback for text.embed.

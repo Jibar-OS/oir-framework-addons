@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026 The OpenIntelligenceRuntime Project
+ * Copyright (C) 2026 The Open Intelligence Runtime Project, a JibarOS project
  * Licensed under the Apache License, Version 2.0
  *
  * Worker memory state — surfaced via cmd oir dumpsys memory (v0.4 S2).
